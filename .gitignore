@@ -1,0 +1,17 @@
+# Rust / Tauri
+**/target/
+**/gen/schemas/
+
+# Node
+node_modules/
+dist/
+*.log
+
+# Build artifacts
+apps/*/src-tauri/icons/*.ico.md
+dist/*.exe
+pushtest.log
+
+# OS
+.DS_Store
+Thumbs.db

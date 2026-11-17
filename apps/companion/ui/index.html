@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>8EH Companion</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #14161a; color: #e7e7e7;
+      margin: 0; padding: 20px;
+    }
+    h2 { margin: 0 0 4px; font-size: 18px; }
+    .sub { color: #8b8f98; font-size: 12px; margin-bottom: 18px; }
+    label { display: block; font-size: 12px; margin: 12px 0 4px; color: #aeb3bd; }
+    input {
+      width: 100%; box-sizing: border-box; padding: 8px 10px;
+      background: #1e2128; color: #e7e7e7; border: 1px solid #333842;
+      border-radius: 6px; font-size: 13px;
+    }
+    input:focus { outline: none; border-color: #D83232; }
+    button {
+      margin-top: 12px; padding: 8px 14px; font-size: 13px;
+      background: #D83232; color: #fff; border: none; border-radius: 6px;
+      cursor: pointer; width: 100%;
+    }
+    button.secondary { background: #2a2e36; }
+    button:hover { filter: brightness(1.1); }
+    hr { border: none; border-top: 1px solid #2a2e36; margin: 20px 0; }
+    #status {
+      margin-top: 16px; font-size: 12px; padding: 8px 10px;
+      background: #1e2128; border-radius: 6px; min-height: 18px;
+      color: #aeb3bd; word-break: break-all;
+    }
+    #status.ok { color: #6fe08a; }
+    #status.err { color: #ff7a7a; }
+  </style>
+</head>
+<body>
+  <h2>8EH Companion Agent</h2>
+  <div class="sub">Metadata lagu otomatis ke widget situs</div>
+
+  <label>Site URL</label>
+  <input id="url" placeholder="https://8eh.link" />
+  <label>Device Token</label>
+  <input id="token" type="password" placeholder="dari tim teknis" />
+  <button id="save" type="button">Simpan Konfigurasi</button>
+
+  <hr />
+
+  <label>Judul Program / Segmen Obrolan</label>
+  <input id="prog" placeholder="cth: Talkshow Sore" />
+  <button id="setprog" type="button">Set Mode Program</button>
+  <button id="setauto" class="secondary" type="button">Kembali ke Otomatis</button>
+
+  <div id="status">memuat…</div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+    const $ = (id) => document.getElementById(id);
+
+    async function loadConfig() {
+      const c = await invoke("get_config");
+      $("url").value = c.url || "";
+      $("token").value = c.token || "";
+    }
+
+    async function poll() {
+      try {
+        const s = await invoke("get_status");
+        const el = $("status");
+        el.className = s.push_ok ? "ok" : "err";
+        el.textContent =
+          (s.push_ok ? "Terhubung" : "GAGAL: " + s.last_error) +
+          " | mode: " + s.mode +
+          (s.last_title ? " | terakhir: " + s.last_title : "");
+      } catch (e) {
+        $("status").textContent = "status tidak tersedia";
+      }
+    }
+
+    $("save").onclick = async () => {
+      await invoke("save_config", { url: $("url").value.trim(), token: $("token").value.trim() });
+      poll();
+    };
+    $("setprog").onclick = async () => {
+      const t = $("prog").value.trim();
+      if (t) { await invoke("set_mode", { program: t }); poll(); }
+    };
+    $("setauto").onclick = async () => {
+      $("prog").value = "";
+      await invoke("set_mode", { program: null });
+      poll();
+    };
+
+    loadConfig();
+    poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>
