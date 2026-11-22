@@ -5,6 +5,8 @@ mod loopback;
 
 use mixer::RunningMix;
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
@@ -128,10 +130,13 @@ struct EngineState {
     candidate_seen: Option<SystemTime>,
     candidate_title: String,
     candidate_artist: String,
+    candidate_artwork: Option<Artwork>,
     last_heartbeat: Option<SystemTime>,
     push_ok: bool,
     last_error: String,
     last_title: String,
+    last_artist: String,
+    last_cover: String,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Serialize)]
@@ -148,12 +153,58 @@ struct MetadataStatus {
     last_error: String,
     mode: Mode,
     last_title: String,
+    last_artist: String,
+    last_cover: String,
 }
 
 struct Playback {
     title: String,
     artist: String,
     playing: bool,
+    artwork: Option<Artwork>,
+}
+
+const MAX_ARTWORK_BYTES: u64 = 512 * 1024;
+
+struct Artwork {
+    mime_type: &'static str,
+    data: String,
+    fingerprint: u64,
+}
+
+fn artwork_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn read_artwork(props: &smtc::GlobalSystemMediaTransportControlsSessionMediaProperties) -> Option<Artwork> {
+    let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.get().ok()?;
+    let size = stream.Size().ok()?;
+    if size == 0 || size > MAX_ARTWORK_BYTES {
+        return None;
+    }
+    let input = stream.GetInputStreamAt(0).ok()?;
+    let reader = windows::Storage::Streams::DataReader::CreateDataReader(&input).ok()?;
+    if reader.LoadAsync(size as u32).ok()?.get().ok()? != size as u32 {
+        return None;
+    }
+    let mut bytes = vec![0; size as usize];
+    reader.ReadBytes(&mut bytes).ok()?;
+    let mime_type = artwork_mime(&bytes)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(Artwork {
+        mime_type,
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        fingerprint: hasher.finish(),
+    })
 }
 
 fn read_playback() -> Option<Playback> {
@@ -167,18 +218,27 @@ fn read_playback() -> Option<Playback> {
         return None;
     }
     let mut chosen: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
+    let mut first_playing: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
+    let mut first_session: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
     for i in 0..count {
         let s = sessions.GetAt(i).ok()?;
-        let src = s.SourceAppUserModelId().ok().map(|v| v.to_string())?;
-        if src.to_lowercase().contains("spotify") {
-            chosen = Some(s);
-            break;
+        if first_session.is_none() {
+            first_session = Some(s.clone());
         }
-        if chosen.is_none() {
-            chosen = Some(s);
+        let is_playing = s.GetPlaybackInfo().ok().and_then(|info| info.PlaybackStatus().ok())
+            == Some(smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+        if is_playing {
+            let src = s.SourceAppUserModelId().ok().map(|v| v.to_string()).unwrap_or_default();
+            if src.to_lowercase().contains("spotify") {
+                chosen = Some(s);
+                break;
+            }
+            if first_playing.is_none() {
+                first_playing = Some(s);
+            }
         }
     }
-    let session = chosen?;
+    let session = chosen.or(first_playing).or(first_session)?;
     let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
     let playing = match session.GetPlaybackInfo() {
         Ok(info) => matches!(
@@ -191,6 +251,7 @@ fn read_playback() -> Option<Playback> {
         title: props.Title().ok()?.to_string(),
         artist: props.Artist().unwrap_or_default().to_string(),
         playing,
+        artwork: if playing { read_artwork(&props) } else { None },
     })
 }
 
@@ -246,11 +307,13 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
         let key = format!("prog|{}", state.program_title);
         if key != state.last_sent_key {
             match send_post(client, cfg, serde_json::json!({ "mode": "program", "title": state.program_title })) {
-                Ok(_) => {
+                Ok(response) => {
                     state.last_sent_key = key;
                     state.push_ok = true;
                     state.last_error.clear();
                     state.last_title = state.program_title.clone();
+                    state.last_artist.clear();
+                    state.last_cover = response["coverImage"].as_str().unwrap_or("").to_string();
                 }
                 Err(e) => {
                     state.push_ok = false;
@@ -273,7 +336,7 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
         return;
     }
 
-    let key = format!("{}|{}", pb.title, pb.artist);
+    let key = format!("{}|{}|{}", pb.title, pb.artist, pb.artwork.as_ref().map(|a| a.fingerprint).unwrap_or(0));
     if key == state.last_sent_key {
         return;
     }
@@ -282,6 +345,7 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
         state.candidate_seen = Some(SystemTime::now());
         state.candidate_title = pb.title;
         state.candidate_artist = pb.artist;
+        state.candidate_artwork = pb.artwork;
         return;
     }
     if state
@@ -291,22 +355,29 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
     {
         return;
     }
+    let mut body = serde_json::json!({
+        "mode": "auto",
+        "title": state.candidate_title,
+        "artist": state.candidate_artist,
+        "playbackState": "Playing",
+    });
+    if let Some(artwork) = &state.candidate_artwork {
+        body["artwork"] = serde_json::json!({ "mimeType": artwork.mime_type, "data": artwork.data });
+    }
     match send_post(
         client,
         cfg,
-        serde_json::json!({
-            "mode": "auto",
-            "title": state.candidate_title,
-            "artist": state.candidate_artist,
-            "playbackState": "Playing",
-        }),
+        body,
     ) {
-        Ok(_) => {
+        Ok(response) => {
             state.last_sent_key = state.candidate_key.clone();
             state.candidate_key.clear();
+            state.candidate_artwork = None;
             state.push_ok = true;
             state.last_error.clear();
             state.last_title = state.candidate_title.clone();
+            state.last_artist = state.candidate_artist.clone();
+            state.last_cover = response["coverImage"].as_str().unwrap_or("").to_string();
         }
         Err(e) => {
             state.push_ok = false;
@@ -324,6 +395,8 @@ fn try_clear(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking::
         state.push_ok = true;
         state.last_error.clear();
         state.last_title.clear();
+        state.last_artist.clear();
+        state.last_cover.clear();
     }
 }
 
@@ -800,6 +873,8 @@ fn get_metadata_status(state: tauri::State<Mutex<EngineState>>) -> MetadataStatu
         last_error: st.last_error.clone(),
         mode: st.mode,
         last_title: st.last_title.clone(),
+        last_artist: st.last_artist.clone(),
+        last_cover: st.last_cover.clone(),
     }
 }
 

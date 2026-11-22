@@ -98,7 +98,7 @@
             <h2>Status pengiriman</h2><p class="subcopy">Diperbarui otomatis setiap beberapa detik.</p>
             <div class="status-card"><span class="status-card-label">Widget situs</span><span class="status-card-value status-value" id="m-push">Memuat…</span></div>
             <div class="status-card"><span class="status-card-label">Mode aktif</span><span class="status-card-value" id="m-mode">Otomatis</span></div>
-            <div class="status-card"><span class="status-card-label">Terakhir terkirim</span><span class="status-card-value large" id="m-title">—</span></div>
+            <div class="status-card metadata-preview"><img id="m-cover" class="metadata-cover" src="images/8eh.png" alt="Cover lagu" /><div><span class="status-card-label">Terakhir terkirim</span><span class="status-card-value large" id="m-title">—</span><span class="metadata-artist" id="m-artist"></span></div></div>
             <div class="feedback" id="meta-status" role="status" aria-live="polite">Memuat status…</div>
           </div>
           <div class="panel content-panel">
@@ -364,9 +364,14 @@
         $("m-push").className = "status-card-value status-value " + (s.push_ok ? "ok" : "err");
         $("m-mode").textContent = s.mode === "program" ? "Program" : "Otomatis";
         $("m-title").textContent = s.last_title || "—";
+        $("m-artist").textContent = s.last_artist || "";
         feedback("meta-status", s.last_error ? "Gagal mengirim: " + s.last_error : "Engine metadata berjalan.", s.last_error ? "err" : "ok");
         // disable tombol mode bila metadata dimatikan / belum login
         const cfg = await invoke("get_config");
+        const cover = s.last_cover
+          ? (s.last_cover.startsWith("/") ? cfg.url.replace(/\/$/, "") + s.last_cover : s.last_cover)
+          : "images/8eh.png";
+        if (cover !== failedCover && $("m-cover").getAttribute("src") !== cover) $("m-cover").src = cover;
         const metaUsable = !!cfg.token && cfg.metadata_on;
         $("setprog").disabled = !metaUsable;
         $("setauto").disabled = !metaUsable;
@@ -375,6 +380,12 @@
         }
       } catch (e) { feedback("meta-status", "Status metadata belum tersedia: " + e, "err"); }
     }
+
+    let failedCover = "";
+    $("m-cover").onerror = () => {
+      failedCover = $("m-cover").src;
+      $("m-cover").src = "images/8eh.png";
+    };
 
     // ---- mode program / auto ----
     $("setprog").onclick = async () => {
