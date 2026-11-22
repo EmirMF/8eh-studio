@@ -26,7 +26,7 @@ poc/
 ## Cara pakai (Windows)
 
 ```powershell
-cd C:\Users\Meong\Documents\8eh-app\poc\windows
+cd C:\Users\Meong\Documents\8eh-studio\poc\windows
 
 # 1. Metadata — jalankan Spotify (atau Chrome) lalu putar lagu, lalu:
 .\metadata-watcher.ps1 -Once             # satu poll

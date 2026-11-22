@@ -1,5 +1,5 @@
 # ICO valid: header ICONDIR + entry + payload PNG 32x32 (didukung Vista+)
-$dir = "C:\Users\Meong\Documents\8eh-app\apps\companion\src-tauri\icons"
+$dir = Join-Path $PSScriptRoot 'src-tauri\icons'
 $png = [System.IO.File]::ReadAllBytes("$dir\32x32.png")
 
 $ms = New-Object System.IO.MemoryStream

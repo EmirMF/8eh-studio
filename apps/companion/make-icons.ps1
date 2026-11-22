@@ -17,7 +17,7 @@ function Make-Png($size, $path) {
   $bmp.Dispose()
 }
 
-$dir = "C:\Users\Meong\Documents\8eh-app\apps\companion\src-tauri\icons"
+$dir = Join-Path $PSScriptRoot 'src-tauri\icons'
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 Make-Png 32 "$dir\32x32.png"
 Make-Png 128 "$dir\128x128.png"

@@ -3,248 +3,185 @@
 <head>
   <meta charset="UTF-8" />
   <title>8EH Studio</title>
-  <style>
-    :root { color-scheme: dark; --red: #D83232; }
-    * { box-sizing: border-box; }
-    body {
-      font-family: "Segoe UI", system-ui, sans-serif;
-      background: #14161a; color: #e7e7e7;
-      margin: 0; user-select: none;
-    }
-    .tabs {
-      display: flex; border-bottom: 1px solid #2a2e36;
-      background: #191c21; position: sticky; top: 0; z-index: 2;
-    }
-    .tab {
-      flex: 1; padding: 12px 8px; text-align: center; cursor: pointer;
-      font-size: 13px; color: #8b8f98; border-bottom: 2px solid transparent;
-    }
-    .tab.active { color: #fff; border-bottom: 2px solid var(--red); }
-    .page { display: none; padding: 16px; }
-    .page.active { display: block; }
-
-    h3 { margin: 0 0 12px; font-size: 15px; }
-    label { display: block; font-size: 12px; margin: 10px 0 4px; color: #aeb3bd; }
-    input, select {
-      width: 100%; padding: 8px 10px; background: #1e2128; color: #e7e7e7;
-      border: 1px solid #333842; border-radius: 6px; font-size: 13px;
-    }
-    input:focus, select:focus { outline: none; border-color: var(--red); }
-    button {
-      padding: 8px 14px; font-size: 13px; background: var(--red); color: #fff;
-      border: none; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 12px;
-    }
-    button.secondary { background: #2a2e36; }
-    button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    /* ===== mixer ===== */
-    .mixer {
-      display: flex; gap: 10px; background: #101216;
-      border: 1px solid #2a2e36; border-radius: 10px; padding: 14px;
-      justify-content: center;
-    }
-    .strip {
-      display: flex; flex-direction: column; align-items: center; gap: 8px;
-      min-width: 92px; padding: 10px 6px; border-radius: 8px; background: #171a1f;
-      border: 1px solid #2a2e36;
-    }
-    .strip.bus { background: #1c1618; }
-    .strip .name { font-size: 11px; color: #8b8f98; text-align: center; }
-    .strip .dev {
-      font-size: 10px; color: #6b7078; text-align: center; width: 84px;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    /* fader vertikal */
-    .fader-wrap { height: 150px; display: flex; align-items: center; }
-    input[type="range"].fader {
-      writing-mode: vertical-lr; direction: rtl;
-      width: 30px; height: 150px; accent-color: var(--red);
-      background: transparent; cursor: pointer;
-    }
-    .db-label { font-size: 10px; color: #8b8f98; font-family: Consolas, monospace; }
-    /* meter */
-    .vu {
-      width: 12px; height: 150px; background: #0d0f12;
-      border: 1px solid #333842; border-radius: 3px; position: relative; overflow: hidden;
-    }
-    .vu-fill {
-      position: absolute; bottom: 0; left: 0; right: 0; height: 0%;
-      background: #4caf50;
-      transition: height 0.12s, background 0.12s;
-    }
-    .routes { display: flex; flex-direction: column; gap: 4px; }
-    .route-btn {
-      width: 100%; margin: 0; padding: 4px 0; font-size: 11px;
-      border-radius: 5px; background: #23262d; color: #8b8f98;
-    }
-    .route-btn.on { background: var(--red); color: #fff; }
-
-    .big-btn { font-size: 18px; padding: 14px; margin-top: 16px; letter-spacing: 2px; }
-
-    .status-row { display: flex; gap: 10px; margin-top: 14px; }
-    .status-box {
-      flex: 1; background: #1e2128; border-radius: 6px; padding: 9px;
-      font-size: 12px; color: #aeb3bd;
-    }
-    .status-box b { display: block; font-size: 14px; margin-bottom: 2px; color: #e7e7e7; }
-    .ok { color: #6fe08a; } .err { color: #ff7a7a; }
-
-    #log {
-      margin-top: 12px; font-size: 11px; font-family: Consolas, monospace;
-      background: #101216; border: 1px solid #2a2e36; border-radius: 6px;
-      padding: 8px; max-height: 150px; overflow-y: auto;
-      white-space: pre-wrap; color: #9aa0aa; user-select: text;
-    }
-    .hint { font-size: 11px; color: #6b7078; margin-top: 8px; line-height: 1.5; }
-  </style>
+  <link rel="icon" type="image/png" href="images/8eh.png" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="tabs">
-    <div class="tab active" data-page="siaran">Siaran</div>
-    <div class="tab" data-page="metadata">Metadata</div>
-    <div class="tab" data-page="pengaturan">Pengaturan</div>
+  <div class="login-gate" id="login-gate">
+    <div class="panel login-gate-card">
+      <img src="images/8eh.png" alt="8EH" class="login-gate-logo" />
+      <p class="eyebrow">8EH Studio</p>
+      <h1>Masuk untuk mulai</h1>
+      <p class="subcopy">Tautkan perangkat ini dengan akun kru 8EH. Persetujuan dibuka di browser.</p>
+      <button class="button primary full" id="gate-login" type="button">Login dengan Google</button>
+      <p class="hint" id="gate-message" role="status">Memeriksa akses perangkat…</p>
+      <button class="button ghost" id="gate-retry" type="button">Periksa lagi</button>
+      <details class="gate-advanced" id="gate-advanced">
+        <summary>Pengaturan lanjutan</summary>
+        <div class="gate-advanced-content">
+          <div class="field gate-site-field"><label for="gate-url">Alamat situs</label><input id="gate-url" type="url" value="https://www.8ehradioitb.com" placeholder="https://www.8ehradioitb.com" /></div>
+          <button class="button ghost full" id="gate-local" type="button">Gunakan localhost:3000</button>
+        </div>
+      </details>
+    </div>
   </div>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><img class="brand-logo" src="images/8eh.png" alt="8EH" /><span class="brand-name">Studio</span></div>
+      <div class="header-status" aria-live="polite"><span class="status-light" id="header-light"></span><span id="header-state">OFF AIR</span></div>
+    </header>
+    <nav class="tabs" aria-label="Halaman" role="tablist">
+      <button class="tab active" id="tab-siaran" data-page="siaran" role="tab" aria-controls="page-siaran" aria-selected="true">Siaran</button>
+      <button class="tab" id="tab-metadata" data-page="metadata" role="tab" aria-controls="page-metadata" aria-selected="false">Metadata</button>
+      <button class="tab" id="tab-pengaturan" data-page="pengaturan" role="tab" aria-controls="page-pengaturan" aria-selected="false">Pengaturan</button>
+    </nav>
 
-  <!-- ======== TAB SIARAN ======== -->
-  <div class="page active" id="page-siaran">
-    <h3>Mixer Siaran</h3>
-    <div class="mixer">
-      <!-- Input 1 -->
-      <div class="strip">
-        <div class="name">INPUT 1</div>
-        <div class="dev" id="dev1-name" title="">—</div>
-        <div class="fader-wrap">
-          <input type="range" class="fader" id="fader1" min="0" max="100" step="1" value="88" />
-          <div class="vu"><div class="vu-fill" id="vu1"></div></div>
+    <main>
+      <section class="page active" id="page-siaran" role="tabpanel" aria-labelledby="tab-siaran">
+        <div class="page-heading"><div><p class="eyebrow">Broadcast desk</p><h1>Siaran</h1><p class="subcopy">Kontrol audio dan status stream langsung.</p></div></div>
+        <div class="broadcast-layout">
+          <div class="broadcast-main">
+            <div class="panel live-panel" id="live-panel">
+              <div class="live-state"><span class="live-indicator" aria-hidden="true"></span><div><div class="live-label" id="b-state">OFF AIR</div><div class="live-caption" id="live-caption">Stream tidak aktif</div></div></div>
+              <div class="live-timer"><div class="value" id="b-time">00:00</div><div class="caption">Durasi</div></div>
+            </div>
+            <div class="section-title"><h2>Mixer</h2><span class="subcopy">A · Siaran &nbsp; B · Monitor</span></div>
+            <div class="mixer" aria-label="Mixer siaran">
+              <div class="strip">
+                <div class="name">INPUT 1</div><div class="dev" id="dev1-name" title="">—</div>
+                <div class="fader-wrap"><input type="range" class="fader" id="fader1" aria-label="Gain input 1" min="0" max="112" step="1" value="88" /><div class="vu" aria-hidden="true"><div class="vu-fill" id="vu1"></div></div></div>
+                <div class="db-label" id="db1">0.0 dB</div>
+                <div class="routes"><button class="route-btn" id="r1-a" type="button">A · Siaran</button><button class="route-btn" id="r1-b" type="button">B · Monitor</button></div>
+              </div>
+              <div class="strip">
+                <div class="name">INPUT 2</div><div class="dev" id="dev2-name" title="">Tidak aktif</div>
+                <div class="fader-wrap"><input type="range" class="fader" id="fader2" aria-label="Gain input 2" min="0" max="112" step="1" value="88" /><div class="vu" aria-hidden="true"><div class="vu-fill" id="vu2"></div></div></div>
+                <div class="db-label" id="db2">0.0 dB</div>
+                <div class="routes"><button class="route-btn" id="r2-a" type="button">A · Siaran</button><button class="route-btn" id="r2-b" type="button">B · Monitor</button></div>
+              </div>
+              <div class="strip bus">
+                <div class="name">BUS A<br />SIARAN</div><div class="dev">Icecast</div>
+                <div class="fader-wrap"><div class="vu" aria-hidden="true"><div class="vu-fill" id="vuA"></div></div></div>
+                <div class="db-label" id="dbA">—</div><div class="routes"></div>
+              </div>
+              <div class="strip bus">
+                <div class="name">BUS B<br />MONITOR</div><div class="dev" id="mon-name">—</div>
+                <div class="fader-wrap"><input type="range" class="fader" id="faderM" aria-label="Gain monitor" min="0" max="112" step="1" value="88" /><div class="vu" aria-hidden="true"><div class="vu-fill" id="vuB"></div></div></div>
+                <div class="db-label" id="dbM">0.0 dB</div><div class="routes"></div>
+              </div>
+            </div>
+            <p class="mixer-legend">Fader: 0 dB = unity. Meter: hijau normal · kuning tinggi · merah mendekati clipping.</p>
+            <div class="feedback" id="preview-feedback" role="status" aria-live="polite">Pilih Input 1 untuk melihat level audio sebelum sesi.</div>
+          </div>
+          <aside class="panel side-panel">
+            <h2>Kontrol siaran</h2>
+            <p class="subcopy">Siaran langsung, dengan rekaman lokal bila diperlukan.</p>
+            <label class="record-choice" for="record-enabled"><input id="record-enabled" type="checkbox" checked /><span><strong>Rekam sesi</strong><small>Simpan MP3 di Music\8EH</small></span></label>
+            <button class="button primary full big" id="onair" type="button">Mulai sesi</button>
+            <button class="button ghost full" id="retry-stream" type="button" hidden>Coba siaran lagi</button>
+            <button class="button ghost full" id="open-recordings" type="button">Buka folder rekaman</button>
+            <div class="feedback" id="broadcast-feedback" role="status" aria-live="polite"></div>
+            <hr class="side-divider" />
+            <div class="fact"><span class="fact-label">Akun kru</span><span class="fact-value" id="b-user">—</span></div>
+            <div class="fact"><span class="fact-label">Input utama</span><span class="fact-value" id="b-device">—</span></div>
+            <div class="fact"><span class="fact-label">Server</span><span class="fact-value" id="b-server">—</span></div>
+            <p class="notice">Pilihan rekam dan perubahan perangkat berlaku pada sesi berikutnya.</p>
+          </aside>
         </div>
-        <div class="db-label" id="db1">0.0 dB</div>
-        <div class="routes">
-          <button class="route-btn" id="r1-a">→ A (Siaran)</button>
-          <button class="route-btn" id="r1-b">→ B (Monitor)</button>
+        <details class="panel log-panel"><summary>Log siaran</summary><pre id="log">…</pre></details>
+      </section>
+
+      <section class="page" id="page-metadata" role="tabpanel" aria-labelledby="tab-metadata" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Now playing</p><h1>Metadata</h1><p class="subcopy">Judul lagu dan program yang tampil di situs.</p></div></div>
+        <div class="content-grid">
+          <div class="panel content-panel">
+            <h2>Status pengiriman</h2><p class="subcopy">Diperbarui otomatis setiap beberapa detik.</p>
+            <div class="status-card"><span class="status-card-label">Widget situs</span><span class="status-card-value status-value" id="m-push">Memuat…</span></div>
+            <div class="status-card"><span class="status-card-label">Mode aktif</span><span class="status-card-value" id="m-mode">Otomatis</span></div>
+            <div class="status-card"><span class="status-card-label">Terakhir terkirim</span><span class="status-card-value large" id="m-title">—</span></div>
+            <div class="feedback" id="meta-status" role="status" aria-live="polite">Memuat status…</div>
+          </div>
+          <div class="panel content-panel">
+            <h2>Mode program</h2><p class="subcopy">Tampilkan judul acara saat tidak memutar lagu.</p>
+            <div class="field"><label for="prog">Judul program atau segmen</label><input id="prog" placeholder="Contoh: Talkshow Sore" /></div>
+            <div class="actions"><button class="button primary" id="setprog" type="button">Aktifkan program</button><button class="button" id="setauto" type="button">Kembali otomatis</button></div>
+            <div class="feedback" id="mode-feedback" role="status" aria-live="polite"></div>
+          </div>
         </div>
-      </div>
-      <!-- Input 2 -->
-      <div class="strip">
-        <div class="name">INPUT 2</div>
-        <div class="dev" id="dev2-name" title="">tidak aktif</div>
-        <div class="fader-wrap">
-          <input type="range" class="fader" id="fader2" min="0" max="100" step="1" value="88" />
-          <div class="vu"><div class="vu-fill" id="vu2"></div></div>
+      </section>
+
+      <section class="page" id="page-pengaturan" role="tabpanel" aria-labelledby="tab-pengaturan" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Setup</p><h1>Pengaturan</h1><p class="subcopy">Akun, perangkat audio, dan koneksi stream.</p></div></div>
+        <div class="settings-grid">
+          <div class="panel settings-card">
+            <h2>Akun kru</h2><p class="subcopy">Akses siaran mengikuti role akun 8EH.</p>
+            <div class="status-card"><span class="status-card-label">Login</span><span class="status-card-value" id="s-user">Belum login</span><div class="hint" id="s-scope"></div></div>
+            <div class="actions"><button class="button primary" id="login" type="button">Login dengan Google</button><button class="button ghost" id="logout" type="button">Keluar</button></div>
+            <div class="hint" id="login-hint">Browser akan terbuka untuk persetujuan akun. Role Technic/Developer dapat siaran dan mengelola metadata; Music hanya dapat mengelola metadata.</div>
+          </div>
+          <div class="panel settings-card">
+            <h2>Perangkat audio</h2><p class="subcopy">Pilihan tersimpan langsung saat diganti.</p>
+            <div class="field"><label for="in1">Input 1 · utama</label><select id="in1"></select></div>
+            <div class="field"><label for="in2">Input 2 · opsional</label><select id="in2"></select></div>
+            <div class="actions"><button class="button ghost" id="refresh-in" type="button">Muat ulang input</button></div>
+            <div class="field"><label for="mon">Output monitor · Bus B</label><select id="mon"></select></div>
+            <div class="actions"><button class="button ghost" id="refresh-out" type="button">Muat ulang output</button></div>
+            <div class="feedback" id="device-feedback" role="status" aria-live="polite"></div>
+          </div>
+          <div class="panel settings-card wide">
+            <h2>Server stream</h2><p class="subcopy">Koneksi Icecast diambil otomatis dari situs saat memulai sesi.</p>
+          </div>
+          <div class="panel settings-card wide">
+            <h2>Situs</h2><p class="subcopy">Alamat situs untuk login dan metadata.</p>
+            <div class="field"><label for="url">URL situs</label><input id="url" type="url" placeholder="https://…" /></div>
+          </div>
+          <div class="save-row"><button class="button primary" id="save" type="button">Simpan pengaturan</button><div class="feedback" id="settings-feedback" role="status" aria-live="polite"></div></div>
         </div>
-        <div class="db-label" id="db2">0.0 dB</div>
-        <div class="routes">
-          <button class="route-btn" id="r2-a">→ A (Siaran)</button>
-          <button class="route-btn" id="r2-b">→ B (Monitor)</button>
-        </div>
-      </div>
-      <!-- Bus A -->
-      <div class="strip bus">
-        <div class="name">BUS A<br/>SIARAN</div>
-        <div class="dev">Icecast</div>
-        <div class="fader-wrap">
-          <div class="vu"><div class="vu-fill" id="vuA"></div></div>
-        </div>
-        <div class="db-label" id="dbA">—</div>
-        <div class="routes"></div>
-      </div>
-      <!-- Bus B -->
-      <div class="strip bus">
-        <div class="name">BUS B<br/>MONITOR</div>
-        <div class="dev" id="mon-name">—</div>
-        <div class="fader-wrap">
-          <input type="range" class="fader" id="faderM" min="0" max="100" step="1" value="88" />
-          <div class="vu"><div class="vu-fill" id="vuB"></div></div>
-        </div>
-        <div class="db-label" id="dbM">0.0 dB</div>
-        <div class="routes"></div>
-      </div>
-    </div>
-
-    <button class="big-btn" id="onair" type="button">🔴 ON AIR</button>
-    <div class="status-row">
-      <div class="status-box"><b id="b-state">OFF AIR</b>Status</div>
-      <div class="status-box"><b id="b-time">00:00</b>Durasi</div>
-      <div class="status-box"><b id="b-user">—</b>Login</div>
-    </div>
-    <div id="log">…</div>
-  </div>
-
-  <!-- ======== TAB METADATA ======== -->
-  <div class="page" id="page-metadata">
-    <h3>Metadata Lagu Otomatis</h3>
-    <div class="status-row">
-      <div class="status-box"><b id="m-push">—</b>Widget situs</div>
-      <div class="status-box"><b id="m-mode">auto</b>Mode</div>
-    </div>
-    <div class="status-box" style="margin-top:10px;"><b id="m-title">—</b>Terakhir terkirim</div>
-    <label>Judul Program / Segmen Obrolan (opsional)</label>
-    <input id="prog" placeholder="cth: Talkshow Sore" />
-    <button id="setprog" type="button">Set Mode Program</button>
-    <button id="setauto" class="secondary" type="button">Kembali ke Otomatis</button>
-    <div id="meta-status">…</div>
-  </div>
-
-  <!-- ======== TAB PENGATURAN ======== -->
-  <div class="page" id="page-pengaturan">
-    <h3>Login Kru (Google)</h3>
-    <div class="status-box" style="margin-bottom:8px;">
-      <b id="s-user">Belum login</b>
-      <span id="s-scope" style="font-size:11px;color:#8b8f98;"></span>
-    </div>
-    <button id="login" type="button">🔑 Login dengan Google</button>
-    <button id="logout" class="secondary" type="button" style="margin-top:8px;">Keluar (hapus sesi di app ini)</button>
-    <div class="hint" id="login-hint">
-      Klik login → browser terbuka → login Google akun 8EH → klik <b>Setujui</b>.
-      App otomatis menerima token sesuai role:<br/>
-      · <b>Technic/Developer</b> = siaran + metadata<br/>
-      · <b>Music</b> = hanya metadata
-    </div>
-
-    <h3 style="margin-top:20px;">Input Mixer</h3>
-    <label>Input 1 (utama)</label>
-    <select id="in1"></select>
-    <label>Input 2 (opsional)</label>
-    <select id="in2"></select>
-    <button class="secondary" id="refresh-in" type="button" style="width:auto;padding:4px 10px;font-size:11px;margin-top:6px;">↻ Refresh input</button>
-
-    <h3 style="margin-top:20px;">Monitor (Bus B)</h3>
-    <label>Perangkat output monitor</label>
-    <select id="mon"></select>
-    <button class="secondary" id="refresh-out" type="button" style="width:auto;padding:4px 10px;font-size:11px;margin-top:6px;">↻ Refresh output</button>
-
-    <h3 style="margin-top:20px;">Server Stream (Icecast)</h3>
-    <label>Host</label>
-    <input id="ice-host" />
-    <div style="display:flex; gap:10px;">
-      <div style="flex:1"><label>Port</label><input id="ice-port" type="number" /></div>
-      <div style="flex:1"><label>Bitrate (kbps)</label><input id="bitrate" type="number" /></div>
-    </div>
-    <label>Username</label>
-    <input id="ice-user" />
-    <label>Password (source_pw)</label>
-    <input id="ice-pass" type="password" />
-    <label>Mount</label>
-    <input id="ice-mount" />
-
-    <h3 style="margin-top:20px;">Situs</h3>
-    <label>Site URL</label>
-    <input id="url" />
-
-    <button id="save" type="button">💾 Simpan Pengaturan</button>
-    <div class="hint">Login otomatis menyimpan token perangkat — kru tidak perlu mengurus token.</div>
+      </section>
+    </main>
   </div>
 
   <script>
     const { invoke } = window.__TAURI__.core;
     const $ = (id) => document.getElementById(id);
+    const feedback = (id, message, kind = "") => {
+      const el = $(id);
+      el.textContent = message;
+      el.className = "feedback" + (kind ? " " + kind : "");
+    };
+    const showPage = (page) => {
+      document.querySelectorAll(".tab").forEach((tab) => {
+        const active = tab.dataset.page === page;
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-selected", String(active));
+        tab.tabIndex = active ? 0 : -1;
+      });
+      document.querySelectorAll(".page").forEach((panel) => {
+        const active = panel.id === "page-" + page;
+        panel.classList.toggle("active", active);
+        panel.hidden = !active;
+      });
+    };
+    document.querySelectorAll(".tab").forEach((tab, index, tabs) => {
+      tab.tabIndex = index === 0 ? 0 : -1;
+      tab.onclick = () => showPage(tab.dataset.page);
+      tab.onkeydown = (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+          : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        showPage(tabs[next].dataset.page);
+        tabs[next].focus();
+      };
+    });
 
     // ---- state fader/routing ----
-    // slider fisik 0..100 (posisi) ↔ dB via taper audio logaritmik:
-    //   100 = +12 dB | 88 = 0 dB (unity) | 0 = -60 dB (mati)
-    // Dekat unity: 1 langkah slider ≈ 0,3 dB (presisi).
+    // slider fisik 0..112 (posisi) ↔ dB via taper audio logaritmik:
+    //   112 = +24 dB | 100 = +12 dB | 88 = 0 dB | 0 = -60 dB
+    // Di atas unity: 1 langkah slider = +1 dB.
     const sliderToDb = (v) => {
-      v = Math.max(0, Math.min(100, v));
-      if (v >= 88) return Math.round(((v - 88) / 12) * 12 * 10) / 10;
+      v = Math.max(0, Math.min(112, v));
+      if (v >= 88) return v - 88;
       const t = (88 - v) / 88;              // 0..1 ke bawah
       return Math.round(-60 * Math.pow(t, 2.5) * 10) / 10;
     };
@@ -253,19 +190,10 @@
       r1: 1, r2: 1,              // bit: 1=A, 2=B (default keduanya A)
     };
 
-    document.querySelectorAll(".tab").forEach((tab) => {
-      tab.onclick = () => {
-        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-        document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
-        tab.classList.add("active");
-        $("page-" + tab.dataset.page).classList.add("active");
-      };
-    });
-
     function dbPct(db) {
-      // skala meter: -60..+12 dB → 0..100% (paling bawah = -60)
+      // skala meter dBFS: -60..0 dB → 0..100%
       if (db <= -89) return 0;
-      return Math.max(0, Math.min(100, ((db + 60) / 72) * 100));
+      return Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
     }
     function dbColor(db) {
       // warna sesuai level: hijau < -12, kuning -12..-3, merah > -3
@@ -287,11 +215,27 @@
       });
     }
 
+    let previewError = "";
+    async function ensurePreview() {
+      try {
+        const ready = await invoke("ensure_preview", {
+          gain1Db: mix.g1, gain2Db: mix.g2, route1: mix.r1, route2: mix.r2, monitorDb: mix.gm,
+        });
+        previewError = "";
+        return ready;
+      } catch (error) {
+        previewError = String(error);
+        throw error;
+      }
+    }
+
     // fader events
     const bindFader = (id, key, label) => {
+      $(id).setAttribute("aria-valuetext", "0.0 dB");
       $(id).oninput = (e) => {
         mix[key] = sliderToDb(Number(e.target.value));
         $(label).textContent = mix[key].toFixed(1) + " dB";
+        e.target.setAttribute("aria-valuetext", mix[key].toFixed(1) + " dB");
         pushMix();
       };
     };
@@ -310,98 +254,153 @@
     bindRoute("r1-a", "r1", 1); bindRoute("r1-b", "r1", 2);
     bindRoute("r2-a", "r2", 1); bindRoute("r2-b", "r2", 2);
     function syncRouteButtons() {
-      $("r1-a").className = "route-btn" + (mix.r1 & 1 ? " on" : "");
-      $("r1-b").className = "route-btn" + (mix.r1 & 2 ? " on" : "");
-      $("r2-a").className = "route-btn" + (mix.r2 & 1 ? " on" : "");
-      $("r2-b").className = "route-btn" + (mix.r2 & 2 ? " on" : "");
+      [["r1-a", mix.r1 & 1], ["r1-b", mix.r1 & 2], ["r2-a", mix.r2 & 1], ["r2-b", mix.r2 & 2]].forEach(([id, on]) => {
+        $(id).classList.toggle("on", !!on);
+        $(id).setAttribute("aria-pressed", String(!!on));
+      });
     }
     syncRouteButtons();
 
     // ---- ON AIR ----
+    let broadcastBusy = false;
     $("onair").onclick = async () => {
+      if (broadcastBusy) return;
+      broadcastBusy = true;
+      $("onair").disabled = true;
+      feedback("broadcast-feedback", "Memproses sesi…");
       try {
         const s = await invoke("get_broadcast_status");
         if (s.running) {
-          await invoke("stop_broadcast");
+          const saved = await invoke("stop_broadcast");
+          await ensurePreview().catch((e) => feedback("preview-feedback", "Pratinjau audio: " + e, "err"));
+          feedback("broadcast-feedback", saved ? "Rekaman tersimpan: " + saved : "Sesi diakhiri.", "ok");
         } else {
           // simpan pilihan device dulu
           const cfg = await invoke("get_config");
           cfg.device = $("in1").value || cfg.device;
           cfg.device2 = $("in2").value || null;
           cfg.monitor_device = $("mon").value || "";
+          cfg.record_enabled = $("record-enabled").checked;
           await invoke("save_config", { config: cfg });
+          await ensurePreview();
           await invoke("start_broadcast");
+          feedback("broadcast-feedback", cfg.record_enabled ? "Sesi dimulai. Rekaman berjalan." : "Sesi siaran dimulai tanpa rekaman.", "ok");
         }
       } catch (e) {
-        alert("Gagal: " + e);
+        feedback("broadcast-feedback", "Gagal: " + e, "err");
+      } finally {
+        broadcastBusy = false;
+        pollBroadcast();
       }
+    };
+    $("retry-stream").onclick = async () => {
+      $("retry-stream").disabled = true;
+      try {
+        await invoke("retry_broadcast");
+        feedback("broadcast-feedback", "Mencoba menghubungkan Icecast…", "ok");
+      } catch (e) { feedback("broadcast-feedback", "Gagal: " + e, "err"); }
+      finally { $("retry-stream").disabled = false; pollBroadcast(); }
+    };
+    $("open-recordings").onclick = () => invoke("open_recording_folder").catch((e) => feedback("broadcast-feedback", "Gagal membuka folder: " + e, "err"));
+    $("record-enabled").onchange = async () => {
+      try {
+        const cfg = await invoke("get_config");
+        cfg.record_enabled = $("record-enabled").checked;
+        await invoke("save_config", { config: cfg });
+      } catch (e) { feedback("broadcast-feedback", "Gagal menyimpan pilihan rekam: " + e, "err"); }
     };
 
     // ---- polling ----
     async function pollBroadcast() {
       try {
         const s = await invoke("get_broadcast_status");
-        $("b-state").textContent = s.running ? "ON AIR" : "OFF AIR";
-        $("b-state").className = s.running ? "ok" : "err";
+        const label = s.stream_live ? (s.record_enabled ? "ON AIR + REC" : "ON AIR")
+          : s.running ? (s.record_enabled ? "REC · SIARAN TERPUTUS" : "SIARAN TERPUTUS") : "OFF AIR";
+        $("b-state").textContent = label;
+        $("live-panel").classList.toggle("is-live", s.stream_live);
+        $("live-caption").textContent = s.running
+          ? (s.stream_live ? (s.record_enabled ? "Siaran dan rekaman aktif" : "Siaran aktif tanpa rekaman")
+            : (s.record_enabled ? "Rekaman tetap berjalan" : "Coba hubungkan siaran lagi"))
+          : s.preview_active ? "Pratinjau audio aktif · belum siaran" : "Tidak ada sesi";
+        $("header-state").textContent = label;
+        $("header-light").classList.toggle("live", s.stream_live);
         const mm = String(Math.floor(s.secs / 60)).padStart(2, "0");
         const ss = String(s.secs % 60).padStart(2, "0");
         $("b-time").textContent = `${mm}:${ss}`;
-        $("onair").textContent = s.running ? "⬛ STOP SIARAN" : "🔴 ON AIR";
+        $("onair").textContent = s.running ? (s.record_enabled ? "Akhiri sesi & simpan" : "Akhiri sesi") : "Mulai sesi";
+        $("record-enabled").disabled = s.running || broadcastBusy;
+        $("retry-stream").hidden = !s.running || s.stream_live;
+        $("onair").classList.toggle("danger", s.running);
+        $("onair").classList.toggle("primary", !s.running);
+        const cfg = await invoke("get_config");
+        const logged = !!(cfg.token && cfg.logged_user);
+        $("onair").disabled = broadcastBusy || (!s.running && !(logged && cfg.scope === "broadcast"));
+        $("onair").title = s.running ? (s.record_enabled ? "Simpan rekaman MP3" : "Akhiri siaran") : !logged ? "Login dulu" : cfg.scope !== "broadcast" ? "Role akun hanya untuk metadata" : "";
+        $("b-user").textContent = logged ? cfg.logged_user : "Belum login";
+        $("b-device").textContent = cfg.device || "Belum dipilih";
+        $("b-device").title = cfg.device || "";
+        $("b-server").textContent = "Dari situs 8EH";
+        if (s.running && s.record_enabled && !s.record_live) feedback("broadcast-feedback", "Encoder rekaman berhenti. Akhiri sesi dan periksa file sementara di Music\\8EH.", "err");
         // meter: meters_db = [in1, in2, busA, busB]
         setVu("vu1", s.meters_db[0]);
         setVu("vu2", s.meters_db[1]);
         setVu("vuA", s.meters_db[2]);
         setVu("vuB", s.meters_db[3]);
         $("dbA").textContent = (s.meters_db[2] <= -89 ? "—" : s.meters_db[2].toFixed(0) + " dB");
+        if (previewError && !s.preview_active) feedback("preview-feedback", "Pratinjau audio: " + previewError, "err");
+        else if (s.monitor_error) feedback("preview-feedback", s.monitor_error, "warn");
+        else if (s.preview_active && (s.clipping?.[0] || s.clipping?.[1])) feedback("preview-feedback", "Level clipping: turunkan fader input atau monitor.", "err");
+        else if (s.preview_active) feedback("preview-feedback", "Meter aktif. Nyalakan B pada channel yang ingin didengar di output monitor.", "ok");
+        else feedback("preview-feedback", cfg.scope === "broadcast" ? "Pilih Input 1 untuk melihat level audio sebelum sesi." : "Pratinjau audio tersedia untuk akun siaran.", "warn");
         $("log").textContent = s.log.join("\n") || "…";
         $("log").scrollTop = $("log").scrollHeight;
-      } catch (e) { /* app starting */ }
+      } catch (e) { feedback("broadcast-feedback", "Status siaran belum tersedia: " + e, "err"); }
     }
 
     async function pollMetadata() {
       try {
         const s = await invoke("get_metadata_status");
-        $("m-push").textContent = s.push_ok ? "Terkirim" : "GAGAL";
-        $("m-push").className = s.push_ok ? "ok" : "err";
-        $("m-mode").textContent = s.mode;
+        $("m-push").textContent = s.push_ok ? "Terhubung" : "Belum terhubung";
+        $("m-push").className = "status-card-value status-value " + (s.push_ok ? "ok" : "err");
+        $("m-mode").textContent = s.mode === "program" ? "Program" : "Otomatis";
         $("m-title").textContent = s.last_title || "—";
-        $("meta-status").textContent = s.last_error
-          ? "error: " + s.last_error
-          : "engine jalan normal";
+        feedback("meta-status", s.last_error ? "Gagal mengirim: " + s.last_error : "Engine metadata berjalan.", s.last_error ? "err" : "ok");
         // disable tombol mode bila metadata dimatikan / belum login
         const cfg = await invoke("get_config");
         const metaUsable = !!cfg.token && cfg.metadata_on;
         $("setprog").disabled = !metaUsable;
         $("setauto").disabled = !metaUsable;
         if (!metaUsable) {
-          $("meta-status").textContent = cfg.token
-            ? "metadata device ini dimatikan dari dashboard"
-            : "belum login";
+          feedback("meta-status", cfg.token ? "Metadata perangkat ini dimatikan dari dashboard." : "Login dulu di Pengaturan untuk mengirim metadata.", "warn");
         }
-      } catch (e) {}
+      } catch (e) { feedback("meta-status", "Status metadata belum tersedia: " + e, "err"); }
     }
 
     // ---- mode program / auto ----
     $("setprog").onclick = async () => {
       const title = $("prog").value.trim();
       if (!title) {
-        alert("Isi judul programnya dulu.");
+        feedback("mode-feedback", "Isi judul program terlebih dahulu.", "warn");
+        $("prog").focus();
         return;
       }
       try {
+        feedback("mode-feedback", "Mengaktifkan mode program…");
         await invoke("set_mode", { program: title });
-        $("m-mode").textContent = "program";
-        alert("Mode Program aktif: \"" + title + "\"");
+        $("m-mode").textContent = "Program";
+        feedback("mode-feedback", "Mode program aktif: " + title, "ok");
       } catch (e) {
-        alert("Gagal: " + e);
+        feedback("mode-feedback", "Gagal: " + e, "err");
       }
     };
     $("setauto").onclick = async () => {
       try {
         await invoke("set_mode", { program: null });
-        $("m-mode").textContent = "auto";
+        $("m-mode").textContent = "Otomatis";
+        $("prog").value = "";
+        feedback("mode-feedback", "Mode otomatis aktif.", "ok");
       } catch (e) {
-        alert("Gagal: " + e);
+        feedback("mode-feedback", "Gagal: " + e, "err");
       }
     };
 
@@ -415,16 +414,22 @@
           if (s.status === "approved") {
             stopLinkPolling();
             await refreshLoginState();
-            alert("Login berhasil: " + (s.user?.name || "kru") +
-              (s.scope === "broadcast" ? " (siaran + metadata)" : " (hanya metadata)"));
+            $("login-gate").hidden = true;
+            $("login-hint").textContent = "Login berhasil. Akses: " + (s.scope === "broadcast" ? "siaran dan metadata." : "metadata.");
+            if (s.scope === "broadcast") await ensurePreview().catch((e) => feedback("preview-feedback", "Pratinjau audio: " + e, "err"));
           } else if (s.status === "denied") {
             stopLinkPolling();
-            alert("Permintaan ditolak di browser.");
+            $("login-hint").textContent = "Permintaan login ditolak di browser.";
+            $("gate-message").textContent = "Permintaan ditolak. Klik Login dengan Google untuk mencoba lagi.";
           } else if (s.status === "revoked") {
             stopLinkPolling();
-            alert("Akses perangkat ini dicabut dari dashboard.");
+            $("login-hint").textContent = "Akses perangkat ini dicabut dari dashboard.";
+            $("gate-message").textContent = "Akses perangkat dicabut. Minta persetujuan ulang.";
           }
-        } catch (e) { /* jaringan — coba lagi tick berikutnya */ }
+        } catch (e) {
+          $("login-hint").textContent = "Gagal memeriksa persetujuan: " + e;
+          $("gate-message").textContent = "Gagal memeriksa persetujuan. Pastikan web lokal sudah diperbarui. " + e;
+        }
       }, 2000);
     };
     const stopLinkPolling = () => {
@@ -438,33 +443,75 @@
       $("s-scope").textContent = logged
         ? (c.scope === "broadcast" ? "akses: siaran + metadata" : "akses: hanya metadata")
         : "";
-      $("b-user").textContent = logged ? c.logged_user : "—";
+      $("b-user").textContent = logged ? c.logged_user : "Belum login";
     }
 
     $("login").onclick = async () => {
       try {
         // pastikan URL tersimpan sebelum buka browser
         const c = await invoke("get_config");
-        c.url = $("url").value.trim();
-        if (c.url) await invoke("save_config", { config: c });
+        const requested = new URL($("url").value.trim());
+        if (!["http:", "https:"].includes(requested.protocol)) throw new Error("Alamat situs harus HTTP atau HTTPS.");
+        c.url = requested.origin;
+        $("url").value = c.url;
+        $("gate-url").value = c.url;
+        await invoke("save_config", { config: c });
         await invoke("login_google");
-        $("login-hint").innerHTML = "⏳ Menunggu persetujuan di browser… klik <b>Setujui</b> di tab yang terbuka.";
+        $("login-hint").textContent = "Menunggu persetujuan di browser. Klik Setujui di tab yang terbuka.";
+        $("gate-message").textContent = "Menunggu persetujuan di browser…";
         startLinkPolling();
       } catch (e) {
-        alert("Gagal mulai login: " + e);
+        $("login-hint").textContent = "Gagal mulai login: " + e;
+        $("gate-message").textContent = "Gagal mulai login: " + e;
       }
+    };
+    $("gate-local").onclick = () => { $("gate-url").value = "http://localhost:3000"; $("gate-url").focus(); };
+    $("gate-login").onclick = () => { $("url").value = $("gate-url").value.trim(); $("login").click(); };
+    async function checkLogin() {
+      try {
+        const state = await invoke("validate_login");
+        const session = await invoke("get_broadcast_status");
+        $("login-gate").hidden = state.status === "approved" || session.running;
+        $("gate-message").textContent = state.status === "approved" ? "Akses valid." : "Belum login. Buka browser untuk menautkan perangkat.";
+        await refreshLoginState();
+        if (state.status === "approved" && state.scope === "broadcast") await ensurePreview().catch((e) => feedback("preview-feedback", "Pratinjau audio: " + e, "err"));
+      } catch (e) {
+        const session = await invoke("get_broadcast_status").catch(() => ({ running: false }));
+        $("login-gate").hidden = session.running;
+        $("gate-message").textContent = "Tidak dapat memeriksa akses situs. Periksa koneksi, lalu coba lagi. " + e;
+      }
+    }
+    $("gate-retry").onclick = async () => {
+      try {
+        const requested = new URL($("gate-url").value.trim());
+        if (!["http:", "https:"].includes(requested.protocol)) throw new Error("Alamat situs harus HTTP atau HTTPS.");
+        const c = await invoke("get_config");
+        c.url = requested.origin;
+        await invoke("save_config", { config: c });
+        $("url").value = c.url;
+        await checkLogin();
+      } catch (e) { $("gate-message").textContent = "Alamat situs tidak valid: " + e; }
     };
     $("logout").onclick = async () => {
       stopLinkPolling();
-      await invoke("logout");
-      await refreshLoginState();
-      $("login-hint").innerHTML = "Sesi di app ini dihapus. Device tetap terdaftar sampai dicabut dari dashboard.";
+      try {
+        const session = await invoke("get_broadcast_status");
+        if (session.running) {
+          if (!confirm("Akhiri sesi dan simpan rekaman sebelum keluar?")) return;
+          await invoke("stop_broadcast");
+        }
+        await invoke("logout");
+        await refreshLoginState();
+        $("login-gate").hidden = false;
+        $("login-hint").textContent = "Sesi di app ini dihapus. Perangkat tetap terdaftar sampai dicabut dari dashboard.";
+      } catch (e) { $("login-hint").textContent = "Gagal keluar: " + e; }
     };
 
     // ---- devices ----
     async function loadDevices() {
       const cfg = await invoke("get_config");
       const ins = await invoke("list_input_devices");
+      ins.push("desktop:default");
       const outs = await invoke("list_output_devices");
       const fill = (sel, list, cur, allowNone) => {
         sel.innerHTML = "";
@@ -473,10 +520,21 @@
           o.value = ""; o.textContent = "— tidak dipakai —";
           sel.appendChild(o);
         }
+        if (cur && !list.includes(cur)) {
+          const o = document.createElement("option");
+          o.value = cur; o.textContent = cur + " (tidak ditemukan)";
+          o.selected = true;
+          sel.appendChild(o);
+        }
         for (const d of list) {
           const o = document.createElement("option");
-          o.value = d; o.textContent = d;
+          o.value = d; o.textContent = d === "desktop:default" ? "Desktop audio · output default Windows" : d;
           if (d === cur) o.selected = true;
+          sel.appendChild(o);
+        }
+        if (!list.length && !allowNone && !cur) {
+          const o = document.createElement("option");
+          o.value = ""; o.textContent = "Tidak ada perangkat input";
           sel.appendChild(o);
         }
       };
@@ -484,41 +542,34 @@
       fill($("in2"), ins, cfg.device2 || "", true);
       fill($("mon"), outs, cfg.monitor_device, true);
       $("dev1-name").textContent = cfg.device || "—";
-      $("dev2-name").textContent = cfg.device2 || "tidak aktif";
-      $("mon-name").textContent = cfg.monitor_device || "mati";
+      $("dev2-name").textContent = cfg.device2 || "Tidak aktif";
+      $("mon-name").textContent = cfg.monitor_device || "Tidak aktif";
+      [["dev1-name", cfg.device], ["dev2-name", cfg.device2], ["mon-name", cfg.monitor_device]].forEach(([id, value]) => { $(id).title = value || ""; });
+      feedback("device-feedback", ins.length ? "Daftar perangkat diperbarui." : "Tidak ada input audio terdeteksi.", ins.length ? "ok" : "warn");
       // status login
       refreshLoginState();
-      // scope metadata-only → ON AIR tersembunyi/disabled
-      const logged = !!(cfg.token && cfg.logged_user);
-      const canBroadcast = logged && cfg.scope === "broadcast";
-      $("onair").disabled = !canBroadcast;
-      $("onair").title = canBroadcast
-        ? ""
-        : logged
-          ? "Role kamu hanya berhak metadata (Music)"
-          : "Login dulu di tab Pengaturan";
+      pollBroadcast();
     }
 
-    // simpan pilihan perangkat LANGSUNG saat dropdown diganti;
-    // kalau sedang ON AIR, tawarkan restart siaran dengan device baru.
+    // Pilihan perangkat yang diganti saat sesi aktif berlaku di sesi berikutnya.
     const bindDeviceSelect = (selId, field) => {
       $(selId).onchange = async () => {
-        const c = await invoke("get_config");
-        c[field] = $(selId).value;
-        if (field === "device2" && !c[field]) c[field] = null;
-        await invoke("save_config", { config: c });
-        $("dev1-name").textContent = c.device || "—";
-        $("dev2-name").textContent = c.device2 || "tidak aktif";
-        $("mon-name").textContent = c.monitor_device || "mati";
-        const s = await invoke("get_broadcast_status");
-        if (s.running) {
-          if (confirm("Perangkat diganti saat ON AIR — restart siaran dengan device baru?")) {
-            await invoke("stop_broadcast");
-            try { await invoke("start_broadcast"); } catch (e) { alert("Gagal restart: " + e); }
+        try {
+          const c = await invoke("get_config");
+          c[field] = $(selId).value;
+          if (field === "device2" && !c[field]) c[field] = null;
+          await invoke("save_config", { config: c });
+          $("dev1-name").textContent = c.device || "—";
+          $("dev2-name").textContent = c.device2 || "Tidak aktif";
+          $("mon-name").textContent = c.monitor_device || "Tidak aktif";
+          const s = await invoke("get_broadcast_status");
+          if (s.running) {
+            feedback("device-feedback", "Pilihan baru berlaku pada sesi berikutnya.", "warn");
           } else {
-            alert("Siaran lanjut dengan device lama. Pilihan tersimpan untuk ON AIR berikutnya.");
+            await ensurePreview();
+            feedback("device-feedback", "Pilihan perangkat tersimpan.", "ok");
           }
-        }
+        } catch (e) { feedback("device-feedback", "Gagal memperbarui perangkat: " + e, "err"); }
       };
     };
     bindDeviceSelect("in1", "device");
@@ -530,34 +581,43 @@
     // ---- settings save ----
     async function loadSettings() {
       const c = await invoke("get_config");
-      $("ice-host").value = c.ice_host;
-      $("ice-port").value = c.ice_port;
-      $("bitrate").value = c.bitrate;
-      $("ice-user").value = c.ice_username;
-      $("ice-pass").value = c.ice_password;
-      $("ice-mount").value = c.ice_mount;
       $("url").value = c.url;
+      $("gate-url").value = c.url;
+      $("gate-advanced").open = c.url !== "https://www.8ehradioitb.com";
+      $("record-enabled").checked = c.record_enabled;
     }
     $("save").onclick = async () => {
-      const c = await invoke("get_config");
-      c.ice_host = $("ice-host").value.trim();
-      c.ice_port = Number($("ice-port").value) || 8000;
-      c.bitrate = Number($("bitrate").value) || 192;
-      c.ice_username = $("ice-user").value.trim() || "source";
-      c.ice_password = $("ice-pass").value;
-      c.ice_mount = $("ice-mount").value.trim() || "/radio.mp3";
-      c.url = $("url").value.trim();
-      await invoke("save_config", { config: c });
-      loadDevices();
-      alert("Tersimpan ✓");
+      $("save").disabled = true;
+      feedback("settings-feedback", "Menyimpan…");
+      try {
+        const c = await invoke("get_config");
+        c.url = $("url").value.trim();
+        await invoke("save_config", { config: c });
+        $("gate-url").value = c.url;
+        $("gate-advanced").open = c.url !== "https://www.8ehradioitb.com";
+        feedback("settings-feedback", "Pengaturan tersimpan.", "ok");
+        pollBroadcast();
+      } catch (e) { feedback("settings-feedback", "Gagal menyimpan: " + e, "err"); }
+      finally { $("save").disabled = false; }
     };
 
     // init
-    loadDevices();
-    loadSettings();
+    loadDevices().catch((e) => feedback("device-feedback", "Gagal memuat perangkat: " + e, "err"));
+    loadSettings().catch((e) => feedback("settings-feedback", "Gagal memuat pengaturan: " + e, "err"));
+    checkLogin();
+    const appWindow = window.__TAURI__.window.getCurrentWindow();
+    appWindow.listen("session-close-requested", async () => {
+      if (!confirm("Sesi masih berjalan. Akhiri dan simpan rekaman sebelum menutup Studio?")) return;
+      try {
+        await invoke("stop_broadcast");
+        await appWindow.destroy();
+      } catch (e) { feedback("broadcast-feedback", "Gagal menyimpan rekaman: " + e, "err"); }
+    });
     setInterval(pollBroadcast, 500);
     setInterval(pollMetadata, 2000);
+    setInterval(checkLogin, 30000);
     pollBroadcast();
+    pollMetadata();
   </script>
 </body>
 </html>

@@ -1,12 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mixer;
+mod loopback;
 
 use mixer::RunningMix;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use windows::Media::Control as smtc;
 
 // konversi dB → linear (UI kirim dB, mixer pakai linear)
@@ -32,24 +33,16 @@ struct Config {
     // broadcaster — input
     device: String,         // input 1 (utama)
     device2: Option<String>, // input 2 (opsional)
-    // bus
-    ice_host: String,
-    ice_port: u16,
-    ice_username: String,
-    ice_password: String,
-    ice_mount: String,
-    bitrate: u32,
+    record_enabled: bool,
     // monitor
     monitor_device: String,
     monitor_enabled: bool,
-    // ffmpeg
-    ffmpeg_path: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            url: String::new(),
+            url: "https://www.8ehradioitb.com".into(),
             token: String::new(),
             device_id: String::new(),
             logged_user: String::new(),
@@ -57,15 +50,9 @@ impl Default for Config {
             metadata_on: true,
             device: String::new(),
             device2: None,
-            ice_host: "stream.8ehradioitb.com".into(),
-            ice_port: 8000,
-            ice_username: "source".into(),
-            ice_password: String::new(),
-            ice_mount: "/radio.mp3".into(),
-            bitrate: 192,
+            record_enabled: true,
             monitor_device: String::new(),
             monitor_enabled: false,
-            ffmpeg_path: "ffmpeg".into(),
         }
     }
 }
@@ -112,6 +99,11 @@ fn load_config_file() -> Config {
         cfg.device_id = bytes.iter().map(|b| format!("{b:02x}")).collect();
         persist_config(&cfg);
     }
+    if cfg.url.is_empty() {
+        cfg.url = Config::default().url;
+    }
+    // Persist again so credentials from older Studio versions are removed.
+    persist_config(&cfg);
     cfg
 }
 
@@ -341,10 +333,83 @@ fn try_clear(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking::
 
 #[derive(Default, Serialize, Clone)]
 struct BroadcastUi {
-    running: bool,
-    started_secs: Option<u64>,
-    meters: [f32; 4], // in1, in2, busA, busB (linear RMS)
     log: Vec<String>,
+    last_recording: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BroadcastConfig {
+    host: String,
+    port: u16,
+    mount: String,
+    username: String,
+    password: String,
+    bitrate_kbps: u32,
+}
+
+fn device_get(cfg: &Config, route: &str) -> Result<reqwest::blocking::Response, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(format!("{}{}", cfg.url.trim_end_matches('/'), route))
+        .header("X-Device-Token", &cfg.token)
+        .header("Cache-Control", "no-store")
+        .send()
+        .map_err(|e| format!("Tidak dapat menghubungi situs: {e}"))
+}
+
+fn fetch_broadcast_config(cfg: &Config) -> Result<BroadcastConfig, String> {
+    let response = device_get(cfg, "/api/studio/broadcast-config")?;
+    match response.status().as_u16() {
+        401 => return Err("Login perangkat tidak berlaku. Login ulang.".into()),
+        403 => return Err("Akun tidak memiliki akses siaran.".into()),
+        503 => return Err("Konfigurasi siaran belum siap di situs.".into()),
+        code if code >= 400 => return Err(format!("Situs mengembalikan HTTP {code}")),
+        _ => {}
+    }
+    let source: BroadcastConfig = response.json().map_err(|_| "Format konfigurasi siaran tidak valid".to_string())?;
+    if source.host.is_empty() || source.port == 0 || source.mount.is_empty()
+        || source.username.is_empty() || source.password.is_empty()
+        || !(32..=320).contains(&source.bitrate_kbps) {
+        return Err("Konfigurasi siaran di situs belum lengkap".into());
+    }
+    Ok(source)
+}
+
+#[tauri::command]
+fn validate_login(app: AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<Mutex<Config>>();
+    let cfg = state.lock().unwrap().clone();
+    if cfg.token.is_empty() { return Ok(serde_json::json!({"status":"login"})); }
+    let requested_token = cfg.token.clone();
+    let requested_url = cfg.url.clone();
+    let response = device_get(&cfg, "/api/studio/session")?;
+    if response.status().as_u16() == 401 {
+        let mut cfg = state.lock().unwrap();
+        if cfg.token != requested_token || cfg.url != requested_url {
+            return Ok(serde_json::json!({"status":"login"}));
+        }
+        cfg.token.clear(); cfg.scope.clear(); cfg.logged_user.clear();
+        persist_config(&cfg);
+        suspend_audio_for_access(&app);
+        return Ok(serde_json::json!({"status":"login"}));
+    }
+    if !response.status().is_success() { return Err(format!("HTTP {}", response.status())); }
+    let data: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+    let mut cfg = state.lock().unwrap();
+    if cfg.token != requested_token || cfg.url != requested_url {
+        return Ok(serde_json::json!({"status":"login"}));
+    }
+    cfg.scope = data["scope"].as_str().unwrap_or("").to_string();
+    cfg.logged_user = data["user"]["name"].as_str().unwrap_or("Kru 8EH").to_string();
+    cfg.metadata_on = data["metadataEnabled"].as_bool().unwrap_or(false);
+    persist_config(&cfg);
+    if cfg.scope != "broadcast" {
+        suspend_audio_for_access(&app);
+    }
+    Ok(serde_json::json!({"status":"approved", "scope":cfg.scope}))
 }
 
 impl BroadcastUi {
@@ -364,6 +429,16 @@ fn linear_to_db(lin: f32) -> f32 {
     }
 }
 
+fn suspend_audio_for_access(app: &AppHandle) {
+    let mix = app.state::<Mutex<Option<RunningMix>>>();
+    let active = mix.lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false);
+    if active {
+        if let Some(rm) = mix.lock().unwrap().as_mut() { rm.disconnect_stream(); }
+    } else {
+        let _ = mixer::stop(&mix);
+    }
+}
+
 // ============================================================
 // Login — Google device link (alur /studio-link)
 // ============================================================
@@ -372,6 +447,10 @@ fn linear_to_db(lin: f32) -> f32 {
 /// Kru login Google di web → Setujui → app polling link-status → token masuk.
 #[tauri::command]
 fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
+    if app.state::<Mutex<Option<RunningMix>>>().lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false) {
+        return Err("Akhiri sesi sebelum login ulang".into());
+    }
+    let _ = mixer::stop(&app.state::<Mutex<Option<RunningMix>>>());
     let cfg_state = app.state::<Mutex<Config>>();
     let cfg = cfg_state.lock().unwrap().clone();
     if cfg.url.is_empty() {
@@ -380,27 +459,45 @@ fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
     if cfg.device_id.is_empty() {
         return Err("Device ID belum dibuat — restart app.".into());
     }
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let attempt: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into());
-    let link_url = format!(
-        "{}/studio-link?dev={}&name={}",
-        cfg.url.trim_end_matches('/'),
-        cfg.device_id,
-        format!("8EH Studio - {computer}")
-            .replace(' ', "%20")
-    );
+    let mut link_url = reqwest::Url::parse(&format!("{}/studio-link", cfg.url.trim_end_matches('/')))
+        .map_err(|_| "URL situs tidak valid".to_string())?;
+    link_url.query_pairs_mut()
+        .append_pair("dev", &cfg.device_id)
+        .append_pair("name", &format!("8EH Studio - {computer}"))
+        .append_pair("sid", &attempt);
 
-    // open browser default
+    // ShellExecute memakai asosiasi URL Windows, bukan membuka File Explorer.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &link_url])
-            .creation_flags(0x0800_0000)
-            .spawn();
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = std::ffi::OsStr::new(link_url.as_str()).encode_wide().chain(std::iter::once(0)).collect();
+        let opened = unsafe {
+            ShellExecuteW(None, windows::core::w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+        };
+        if opened.0 as usize <= 32 {
+            return Err("Windows tidak dapat membuka browser default untuk login".into());
+        }
     }
+    {
+        let cfg_state = app.state::<Mutex<Config>>();
+        let mut current = cfg_state.lock().unwrap();
+        current.token.clear();
+        current.scope.clear();
+        current.logged_user.clear();
+        persist_config(&current);
+    }
+    *app.state::<Mutex<Option<String>>>().lock().unwrap() = Some(attempt);
 
-    Ok(serde_json::json!({ "opened": true, "linkUrl": link_url }))
+    Ok(serde_json::json!({ "opened": true, "linkUrl": link_url.as_str() }))
 }
 
 /// Polling status link (dipanggil UI tiap 2s setelah login_google).
@@ -411,10 +508,14 @@ fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
     if cfg.url.is_empty() || cfg.device_id.is_empty() {
         return Ok(serde_json::json!({ "status": "notfound" }));
     }
+    let attempt = match app.state::<Mutex<Option<String>>>().lock().unwrap().clone() {
+        Some(attempt) => attempt,
+        None => return Ok(serde_json::json!({ "status": "notfound" })),
+    };
     let url = format!(
-        "{}/api/studio/link-status?dev={}",
+        "{}/api/studio/link-status?sid={}",
         cfg.url.trim_end_matches('/'),
-        cfg.device_id
+        attempt
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -424,6 +525,7 @@ fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
         .get(&url)
         .send()
         .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
 
     // approved → simpan token + scope
@@ -442,18 +544,23 @@ fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
         cfg.metadata_on = json["metadataEnabled"].as_bool().unwrap_or(true);
         persist_config(&cfg);
     }
+    if matches!(json["status"].as_str(), Some("approved" | "denied" | "revoked")) {
+        *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
+    }
     Ok(json)
 }
 
 /// Logout lokal (hapus token; device tetap terdaftar di server sampai dicabut).
 #[tauri::command]
 fn logout(app: AppHandle) {
+    *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
     let cfg_state = app.state::<Mutex<Config>>();
     let mut cfg = cfg_state.lock().unwrap();
     cfg.token.clear();
     cfg.scope.clear();
     cfg.logged_user.clear();
     persist_config(&cfg);
+    suspend_audio_for_access(&app);
 }
 
 // ============================================================
@@ -482,134 +589,162 @@ fn list_output_devices() -> Vec<String> {
     mixer::list_outputs()
 }
 
+fn bundled_ffmpeg(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let bundled = app.path().resource_dir().map_err(|e| e.to_string())?.join("ffmpeg.exe");
+    if bundled.is_file() { return Ok(bundled); }
+    #[cfg(debug_assertions)]
+    { return Ok(std::path::PathBuf::from("ffmpeg")); }
+    #[cfg(not(debug_assertions))]
+    { Err("FFmpeg tidak ditemukan dalam instalasi Studio".into()) }
+}
+
+fn bounded_db(db: f32) -> f32 { if db.is_finite() { db.clamp(-60.0, 24.0) } else { 0.0 } }
+
+fn prepare_audio_engine(
+    slot: &mut Option<RunningMix>, cfg: &Config,
+    gains: (f32, f32, f32), routes: (u8, u8),
+) -> Result<bool, String> {
+    if cfg.device.is_empty() { return Ok(false); }
+    if let Some(rm) = slot.as_ref() {
+        if rm.matches_devices(cfg) { return Ok(true); }
+        if rm.session_active() { return Err("Pilihan perangkat baru berlaku setelah sesi diakhiri".into()); }
+    }
+    if let Some(mut old) = slot.take() { old.stop_preview(); }
+    *slot = Some(mixer::start_preview(cfg, gains, routes)?);
+    Ok(true)
+}
+
+#[tauri::command]
+fn ensure_preview(
+    app: AppHandle, gain1_db: f32, gain2_db: f32,
+    route1: u8, route2: u8, monitor_db: f32,
+) -> Result<bool, String> {
+    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+    if cfg.token.is_empty() || cfg.scope != "broadcast" { return Ok(false); }
+    let state = app.state::<Mutex<Option<RunningMix>>>();
+    let mut slot = state.lock().unwrap();
+    let gains = (db_to_linear(bounded_db(gain1_db)), db_to_linear(bounded_db(gain2_db)), db_to_linear(bounded_db(monitor_db)));
+    let ready = prepare_audio_engine(&mut slot, &cfg, gains, (route1 & 3, route2 & 3))?;
+    if let Some(rm) = slot.as_ref() {
+        let mut p = rm.shared.params.lock().unwrap();
+        p.gain1 = gains.0; p.gain2 = gains.1; p.monitor_gain = gains.2;
+        p.route1 = route1 & 3; p.route2 = route2 & 3;
+    }
+    Ok(ready)
+}
+
 #[tauri::command]
 fn start_broadcast(app: AppHandle) -> Result<(), String> {
-    let cfg = {
-        let s = app.state::<Mutex<Config>>();
-        let x = s.lock().unwrap().clone(); x
-    };
-    if cfg.logged_user.is_empty() || cfg.token.is_empty() {
-        return Err("Belum login (tab Pengaturan → Login dengan Google)".into());
-    }
-    if cfg.scope != "broadcast" {
-        return Err(
-            "Akun kamu hanya berhak kirim metadata (role Music). Siaran hanya untuk Technic/Developer.".into(),
-        );
-    }
-
-    let ui_state = app.state::<Mutex<BroadcastUi>>();
-    {
-        let mut ui = ui_state.lock().unwrap();
-        ui.push_log("Memulai mixer…".into());
-    }
-
+    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+    if cfg.token.is_empty() || cfg.logged_user.is_empty() { return Err("Login dulu untuk memulai sesi".into()); }
+    if cfg.scope != "broadcast" { return Err("Akun tidak memiliki akses siaran".into()); }
     let mix_state = app.state::<Mutex<Option<RunningMix>>>();
-    if mix_state.lock().unwrap().is_some() {
-        return Err("Siaran sudah berjalan".into());
-    }
-
-    let gains = (1.0f32, 1.0f32, 1.0f32);
-    let routes = (0b01u8, 0b01u8);
-
-    let mut rm = mixer::start(&cfg, gains, routes)?;
-
-    // log ffmpeg stderr ke UI
-    if let Some(stderr) = rm.ffmpeg.stderr.take() {
-        let app_h = app.clone();
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                if line.trim().is_empty() { continue; }
-                let ui_state = app_h.state::<Mutex<BroadcastUi>>();
-                ui_state.lock().unwrap().push_log(line);
-            }
-            // EOF = ffmpeg mati
-            let ui_state = app_h.state::<Mutex<BroadcastUi>>();
-            let mut ui = ui_state.lock().unwrap();
-            ui.running = false;
-            ui.push_log("Encoder berhenti — cek kredensial/koneksi".into());
-        });
-    }
-
-    // thread writer mixing sudah dijalankan di dalam mixer::start
-
-    // update UI
-    {
-        let mut ui = ui_state.lock().unwrap();
-        ui.running = true;
-        ui.started_secs = Some(rm.shared.started_at.elapsed().as_secs());
-        ui.push_log(format!(
-            "ON AIR: {} ({} kb/s){}",
-            cfg.device,
-            cfg.bitrate,
-            if cfg.device2.as_deref().map(|d| !d.is_empty()).unwrap_or(false) {
-                format!(" + {}", cfg.device2.clone().unwrap())
-            } else { String::new() }
-        ));
-    }
-
-    *mix_state.lock().unwrap() = Some(rm);
+    if mix_state.lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false) { return Err("Sesi sudah berjalan".into()); }
+    let source = fetch_broadcast_config(&cfg)?;
+    let ffmpeg = bundled_ffmpeg(&app)?;
+    let recording_dir = app.path().audio_dir().map_err(|e| e.to_string())?.join("8EH");
+    let mut slot = mix_state.lock().unwrap();
+    if !prepare_audio_engine(&mut slot, &cfg, (1.0, 1.0, 1.0), (1, 1))? { return Err("Input 1 belum dipilih".into()); }
+    let rm = slot.as_mut().ok_or("Pratinjau audio belum tersedia")?;
+    rm.start_session(&cfg, &ffmpeg, &source, &recording_dir)?;
+    let connected = rm.shared.stream_live.load(std::sync::atomic::Ordering::SeqCst);
+    drop(slot);
+    let ui_state = app.state::<Mutex<BroadcastUi>>();
+    let mut ui = ui_state.lock().unwrap();
+    ui.push_log(if connected {
+        if cfg.record_enabled { "Sesi dimulai: merekam dan menghubungkan Icecast".into() }
+        else { "Sesi siaran dimulai tanpa rekaman".into() }
+    } else if cfg.record_enabled { "Rekaman dimulai; siaran belum terhubung. Gunakan Coba siaran lagi.".into() }
+    else { "Siaran belum terhubung. Gunakan Coba siaran lagi.".into() });
     Ok(())
 }
 
 #[tauri::command]
-fn stop_broadcast(app: AppHandle) -> Result<(), String> {
-    let mix_state = app.state::<Mutex<Option<RunningMix>>>();
-    mixer::stop(&mix_state);
+fn retry_broadcast(app: AppHandle) -> Result<(), String> {
+    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+    if cfg.scope != "broadcast" || cfg.token.is_empty() { return Err("Login siaran diperlukan".into()); }
+    let source = fetch_broadcast_config(&cfg)?;
+    let ffmpeg = bundled_ffmpeg(&app)?;
+    let state = app.state::<Mutex<Option<RunningMix>>>();
+    let mut slot = state.lock().unwrap();
+    let rm = slot.as_mut().ok_or("Belum ada sesi siaran")?;
+    rm.retry_stream(&ffmpeg, &source)?;
+    app.state::<Mutex<BroadcastUi>>().lock().unwrap().push_log("Mencoba menghubungkan siaran lagi".into());
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_broadcast(app: AppHandle) -> Result<Option<String>, String> {
+    let state = app.state::<Mutex<Option<RunningMix>>>();
+    let mut slot = state.lock().unwrap();
+    let saved = slot.as_mut().ok_or("Belum ada sesi siaran")?.finish_session()?;
+    drop(slot);
+    let saved = saved.map(|p| p.to_string_lossy().to_string());
     let ui_state = app.state::<Mutex<BroadcastUi>>();
     let mut ui = ui_state.lock().unwrap();
-    ui.running = false;
-    ui.push_log("OFF AIR".into());
+    if let Some(path) = &saved {
+        ui.last_recording = path.clone();
+        ui.push_log(format!("Rekaman tersimpan: {path}"));
+    } else {
+        ui.push_log("Sesi siaran diakhiri tanpa rekaman".into());
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+fn open_recording_folder(app: AppHandle) -> Result<(), String> {
+    let path = app.path().audio_dir().map_err(|e| e.to_string())?.join("8EH");
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    std::process::Command::new("explorer.exe").arg(path).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[derive(Serialize, Clone)]
 struct BroadcastStatus {
     running: bool,
+    preview_active: bool,
+    stream_live: bool,
+    record_live: bool,
+    record_enabled: bool,
     secs: u64,
     meters_db: [f32; 4],
+    clipping: [bool; 2],
+    monitor_error: Option<String>,
     log: Vec<String>,
+    last_recording: String,
 }
 
 #[tauri::command]
 fn get_broadcast_status(app: AppHandle) -> BroadcastStatus {
     let mut running = false;
-    let mut secs = 0u64;
+    let mut preview_active = false;
+    let mut stream_live = false;
+    let mut record_live = false;
+    let mut record_enabled = false;
+    let mut secs = 0;
     let mut meters = [0f32; 4];
-    {
-        let mix_state = app.state::<Mutex<Option<RunningMix>>>();
-        let mut slot = mix_state.lock().unwrap();
-        // bersihkan sesi mati
-        let dead = match slot.as_mut() {
-            Some(rm) => rm.ffmpeg.try_wait().map(|r| r.is_some()).unwrap_or(true),
-            None => false,
-        };
-        if dead {
-            *slot = None;
-        }
-        if let Some(rm) = slot.as_ref() {
-            running = true;
-            secs = rm.shared.started_at.elapsed().as_secs();
-            let m = rm.shared.meters.lock().unwrap();
-            meters = *m;
-        }
+    let mut clipping = [false; 2];
+    let mut monitor_error = None;
+    if let Some(rm) = app.state::<Mutex<Option<RunningMix>>>().lock().unwrap().as_mut() {
+        rm.refresh_stream();
+        rm.refresh_record();
+        preview_active = true;
+        running = rm.session_active();
+        stream_live = rm.shared.stream_live.load(std::sync::atomic::Ordering::SeqCst);
+        record_live = rm.shared.record_live.load(std::sync::atomic::Ordering::SeqCst);
+        record_enabled = rm.record_enabled;
+        secs = rm.session_started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0);
+        meters = *rm.shared.meters.lock().unwrap();
+        clipping = rm.shared.last_clip.lock().unwrap().map(|time| time.map(|t| t.elapsed().as_secs_f32() < 1.0).unwrap_or(false));
+        monitor_error = rm.shared.monitor_error.lock().unwrap().clone();
     }
-    let ui_state = app.state::<Mutex<BroadcastUi>>();
-    let ui = ui_state.lock().unwrap();
-    if ui.running {
-        running = true;
-    }
+    let state = app.state::<Mutex<BroadcastUi>>();
+    let ui = state.lock().unwrap();
     BroadcastStatus {
-        running,
-        secs,
-        meters_db: [
-            linear_to_db(meters[0]),
-            linear_to_db(meters[1]),
-            linear_to_db(meters[2]),
-            linear_to_db(meters[3]),
-        ],
+        running, preview_active, stream_live, record_live, record_enabled, secs,
+        meters_db: meters.map(linear_to_db), clipping, monitor_error,
         log: ui.log.clone(),
+        last_recording: ui.last_recording.clone(),
     }
 }
 
@@ -627,11 +762,11 @@ fn set_mixer(
     let slot = mix_state.lock().unwrap();
     if let Some(rm) = slot.as_ref() {
         let mut p = rm.shared.params.lock().unwrap();
-        p.gain1 = db_to_linear(gain1_db);
-        p.gain2 = db_to_linear(gain2_db);
-        p.route1 = route1;
-        p.route2 = route2;
-        p.monitor_gain = db_to_linear(monitor_db);
+        p.gain1 = db_to_linear(bounded_db(gain1_db));
+        p.gain2 = db_to_linear(bounded_db(gain2_db));
+        p.route1 = route1 & 3;
+        p.route2 = route2 & 3;
+        p.monitor_gain = db_to_linear(bounded_db(monitor_db));
     }
 }
 
@@ -701,24 +836,33 @@ fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(load_config_file()))
         .manage(Mutex::new(EngineState::default()))
+        .manage(Mutex::<Option<String>>::new(None))
         .manage(Mutex::new(BroadcastUi::default()))
         .manage(Mutex::<Option<RunningMix>>::new(None))
         .invoke_handler(tauri::generate_handler![
             login_google,
             link_status,
+            validate_login,
             logout,
             get_config,
             save_config,
             list_input_devices,
             list_output_devices,
+            ensure_preview,
             start_broadcast,
+            retry_broadcast,
             stop_broadcast,
+            open_recording_folder,
             get_broadcast_status,
             set_mixer,
             set_mode,
             get_metadata_status
         ])
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let icon = tauri::image::Image::from_app_icon_resource(128)?;
+                window.set_icon(icon)?;
+            }
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
@@ -738,7 +882,7 @@ fn main() {
                     // TERMASUK token (bisa berotasi kalau device di-approve ulang
                     // dari akun lain), metadataEnabled, dan revoked.
                     sync_tick = sync_tick.wrapping_add(1);
-                    if !cfg.url.is_empty() && !cfg.device_id.is_empty() && sync_tick % 30 == 0 {
+                    if !cfg.url.is_empty() && !cfg.device_id.is_empty() && !cfg.token.is_empty() && sync_tick % 30 == 0 {
                         let url = format!(
                             "{}/api/studio/link-status?dev={}",
                             cfg.url.trim_end_matches('/'),
@@ -747,6 +891,8 @@ fn main() {
                         if let Ok(resp) = client.get(&url).send() {
                             if let Ok(v) = resp.json::<serde_json::Value>() {
                                 let mut c = cfg_state.lock().unwrap();
+                                // Abaikan respons lama bila pengguna logout atau mulai login baru.
+                                if c.token == cfg.token && c.url == cfg.url {
                                 if v["status"] == "approved" {
                                     // token bisa ter-rotasi oleh re-approval — selalu segarkan
                                     if let Some(t) = v["token"].as_str() {
@@ -769,7 +915,13 @@ fn main() {
                                     c.scope.clear();
                                     c.logged_user.clear();
                                 }
+                                let may_broadcast = !c.token.is_empty() && c.scope == "broadcast";
                                 persist_config(&c);
+                                drop(c);
+                                if !may_broadcast {
+                                    suspend_audio_for_access(&app_handle);
+                                }
+                                }
                             }
                         }
                     }
@@ -779,9 +931,13 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                let mix_state = window.state::<Mutex<Option<RunningMix>>>();
-                mixer::stop(&mix_state);
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.state::<Mutex<Option<RunningMix>>>().lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false) {
+                    api.prevent_close();
+                    let _ = window.emit("session-close-requested", ());
+                } else {
+                    let _ = mixer::stop(&window.state::<Mutex<Option<RunningMix>>>());
+                }
             }
         })
         .run(tauri::generate_context!())

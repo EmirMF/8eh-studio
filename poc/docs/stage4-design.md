@@ -70,10 +70,10 @@ App `apps/studio/` build sukses. Uji `--push-test` headless:
 
 Catatan lingkungan: disk C: pernah penuh (0 GB) saat build studio;
 dibebaskan 2,3 GB via `cargo clean` companion (exe disalin dulu ke
-`8eh-app\dist\`). Free space setelahnya ~3 GB — **kredit disk tipis,
+`8eh-studio\dist\`). Free space setelahnya ~3 GB — **kredit disk tipis,
 hapus artefak besar lain sebelum release build**.
 
-Binary debug: `8eh-app\dist\studio.exe` + `companion.exe`.
+Binary debug: `8eh-studio\dist\studio.exe` + `companion.exe`.
 
 ## Risk register
 

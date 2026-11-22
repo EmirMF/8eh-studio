@@ -9,12 +9,13 @@
 // Semua mixing di Rust pada rate internal 44100 stereo f32.
 // Fader/routing diubah live lewat MixerParams (tanpa restart stream).
 
-use crate::Config;
+use crate::{BroadcastConfig, Config};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream};
 use std::collections::VecDeque;
 use std::io::Write;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,9 +57,14 @@ pub struct MixerShared {
     monitor: Arc<Mutex<VecDeque<f32>>>,
     pub params: Mutex<MixerParams>,
     pub meters: Mutex<[f32; 4]>, // RMS linear: in1, in2, busA, busB
+    pub last_clip: Mutex<[Option<std::time::Instant>; 2]>,
     pub has2: bool,
     pub stop: AtomicBool,
-    pub started_at: std::time::Instant,
+    stream_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
+    record_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
+    pub stream_live: Arc<AtomicBool>,
+    pub record_live: Arc<AtomicBool>,
+    pub monitor_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MixerShared {
@@ -69,16 +75,21 @@ impl MixerShared {
             monitor: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP))),
             params: Mutex::new(MixerParams::default()),
             meters: Mutex::new([0.0; 4]),
+            last_clip: Mutex::new([None, None]),
             has2,
             stop: AtomicBool::new(false),
-            started_at: std::time::Instant::now(),
+            stream_tx: Mutex::new(None),
+            record_tx: Mutex::new(None),
+            stream_live: Arc::new(AtomicBool::new(false)),
+            record_live: Arc::new(AtomicBool::new(false)),
+            monitor_error: Arc::new(Mutex::new(None)),
         })
     }
 }
 
 // ---------- util ----------
 
-fn push_frames(ring: &Mutex<VecDeque<f32>>, frames: &[(f32, f32)]) {
+pub(crate) fn push_frames(ring: &Mutex<VecDeque<f32>>, frames: &[(f32, f32)]) {
     let mut q = ring.lock().unwrap();
     for (l, r) in frames {
         q.push_back(*l);
@@ -90,28 +101,52 @@ fn push_frames(ring: &Mutex<VecDeque<f32>>, frames: &[(f32, f32)]) {
     }
 }
 
-/// Resample naive linear (baik cukup untuk suara; perangkat umumnya 44.1/48kHz)
-fn resample_stereo(input: &[(f32, f32)], from_rate: f32) -> Vec<(f32, f32)> {
-    if (from_rate - RATE).abs() < 1.0 || input.is_empty() {
-        return input.to_vec();
+fn take_or_silence(ring: &Mutex<VecDeque<f32>>, frames: usize) -> Vec<f32> {
+    let mut q = ring.lock().unwrap();
+    // Hindari memutar audio lama setelah callback perangkat sempat tertunda.
+    let max_backlog = (RATE as usize / 10) * 2;
+    if q.len() > max_backlog {
+        let excess = (q.len() - max_backlog) & !1;
+        for _ in 0..excess { q.pop_front(); }
     }
-    let ratio = from_rate / RATE;
-    let out_len = ((input.len() as f32) / ratio).floor() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let pos = i as f32 * ratio;
-        let i0 = pos.floor() as usize;
-        let i1 = (i0 + 1).min(input.len() - 1);
-        let t = pos - i0 as f32;
-        let l = input[i0].0 + (input[i1].0 - input[i0].0) * t;
-        let r = input[i0].1 + (input[i1].1 - input[i0].1) * t;
-        out.push((l, r));
+    let mut result = vec![0.0; frames * 2];
+    for sample in &mut result {
+        if let Some(value) = q.pop_front() { *sample = value; } else { break; }
     }
-    out
+    result
 }
 
-fn db_to_linear(db: f32) -> f32 {
-    (10.0f32).powf(db / 20.0)
+pub(crate) struct InputResampler {
+    next_position: f64,
+    previous: Option<(f32, f32)>,
+}
+
+impl InputResampler {
+    pub(crate) fn new() -> Self { Self { next_position: 0.0, previous: None } }
+
+    fn process(&mut self, input: &[(f32, f32)], from_rate: f32) -> Vec<(f32, f32)> {
+        if input.is_empty() { return Vec::new(); }
+        if (from_rate - RATE).abs() < 1.0 {
+            self.previous = input.last().copied();
+            return input.to_vec();
+        }
+        let step = from_rate as f64 / RATE as f64;
+        let mut position = self.next_position;
+        let mut output = Vec::with_capacity((input.len() as f64 / step).ceil() as usize);
+        while position < input.len() as f64 {
+            let i0 = position.floor() as isize;
+            let i1 = i0 + 1;
+            if i1 >= input.len() as isize { break; }
+            let first = if i0 < 0 { self.previous.unwrap_or(input[0]) } else { input[i0 as usize] };
+            let second = input[i1 as usize];
+            let t = (position - i0 as f64) as f32;
+            output.push((first.0 + (second.0 - first.0) * t, first.1 + (second.1 - first.1) * t));
+            position += step;
+        }
+        self.next_position = position - input.len() as f64;
+        self.previous = input.last().copied();
+        output
+    }
 }
 
 fn find_input_device(name: &str) -> Result<cpal::Device, String> {
@@ -178,6 +213,14 @@ fn find_output_device(name: &str) -> Result<cpal::Device, String> {
     ))
 }
 
+fn describe_device_error(kind: &str, name: &str, error: String) -> String {
+    if error.contains("0x8889000A") {
+        format!("{kind} '{name}' sedang dipakai aplikasi lain (0x8889000A). Tutup aplikasi seperti Voicemeeter yang memakai perangkat secara eksklusif, lalu coba lagi.")
+    } else {
+        format!("{kind} '{name}': {error}")
+    }
+}
+
 pub fn list_inputs() -> Vec<String> {
     let host = cpal::default_host();
     host.input_devices()
@@ -216,7 +259,13 @@ pub struct StreamGuard {
 impl StreamGuard {
     /// Bangun semua stream di thread baru; kirim error build via channel
     /// dan tunggu hasil agar error terdeteksi sebelum start() balik.
-    pub fn start(build: impl FnOnce() -> Result<Vec<Stream>, String> + Send + 'static) -> Result<Self, String> {
+    pub fn start(
+        build: impl FnOnce() -> Result<Vec<Stream>, String> + Send + 'static,
+        monitor_name: String,
+        monitor_ring: Arc<Mutex<VecDeque<f32>>>,
+        shared: Arc<MixerShared>,
+        monitor_block: Option<String>,
+    ) -> Result<Self, String> {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let handle = std::thread::spawn(move || {
@@ -230,8 +279,43 @@ impl StreamGuard {
                     return;
                 }
             };
-            let _keep = streams; // stream hidup selama thread ini hidup
-            let _ = stop_rx.recv(); // tunggu sinyal stop
+            let _keep = streams; // stream input hidup selama thread ini hidup
+            let mut monitor: Option<Stream> = None;
+            let mut last_attempt = std::time::Instant::now() - Duration::from_secs(3);
+            loop {
+                if stop_rx.recv_timeout(Duration::from_millis(100)).is_ok() { break; }
+                let p = *shared.params.lock().unwrap();
+                let wants_monitor = p.route1 & 2 != 0 || (shared.has2 && p.route2 & 2 != 0);
+                if !wants_monitor {
+                    monitor = None;
+                    monitor_ring.lock().unwrap().clear();
+                    *shared.monitor_error.lock().unwrap() = None;
+                    continue;
+                }
+                if let Some(reason) = monitor_block.as_ref() {
+                    *shared.monitor_error.lock().unwrap() = Some(reason.clone());
+                    continue;
+                }
+                if monitor_name.is_empty() {
+                    *shared.monitor_error.lock().unwrap() = Some("Pilih output monitor di Pengaturan".into());
+                    continue;
+                }
+                if monitor.is_none() && last_attempt.elapsed() >= Duration::from_secs(2) {
+                    last_attempt = std::time::Instant::now();
+                    let opened = find_output_device(&monitor_name)
+                        .and_then(|device| make_output_stream(&device, &monitor_ring))
+                        .and_then(|stream| { stream.play().map_err(|e| e.to_string())?; Ok(stream) });
+                    match opened {
+                        Ok(stream) => {
+                            monitor = Some(stream);
+                            *shared.monitor_error.lock().unwrap() = None;
+                        }
+                        Err(error) => {
+                            *shared.monitor_error.lock().unwrap() = Some(describe_device_error("Output monitor", &monitor_name, error));
+                        }
+                    }
+                }
+            }
         });
         match ready_rx.recv() {
             Ok(Ok(())) => {}
@@ -261,204 +345,272 @@ impl Drop for StreamGuard {
 }
 
 pub struct RunningMix {
-    pub ffmpeg: Child,
     pub shared: Arc<MixerShared>,
+    pub record_enabled: bool,
+    pub session_started_at: Option<std::time::Instant>,
+    pub device: String,
+    pub device2: Option<String>,
+    pub monitor_device: String,
+    record: Option<Child>,
+    stream: Option<Child>,
+    record_writer: Option<std::thread::JoinHandle<()>>,
+    mix_writer: Option<std::thread::JoinHandle<()>>,
+    recording_temp: Option<std::path::PathBuf>,
+    recording_final: Option<std::path::PathBuf>,
     guard: StreamGuard,
+    loopback: Option<crate::loopback::LoopbackGuard>,
 }
 
 impl RunningMix {
-    pub fn elapsed_secs(&self) -> u64 {
-        self.shared.started_at.elapsed().as_secs()
-    }
-}
+    pub fn session_active(&self) -> bool { self.session_started_at.is_some() }
 
-pub fn is_alive(mix: &Mutex<Option<RunningMix>>) -> bool {
-    let mut slot = mix.lock().unwrap();
-    match slot.as_mut() {
-        Some(rm) => {
-            if rm.ffmpeg.try_wait().map(|r| r.is_none()).unwrap_or(false) {
-                true
-            } else {
-                *slot = None;
-                false
+    pub fn matches_devices(&self, cfg: &Config) -> bool {
+        self.device == cfg.device && self.device2 == cfg.device2 && self.monitor_device == cfg.monitor_device
+    }
+
+    pub fn disconnect_stream(&mut self) {
+        *self.shared.stream_tx.lock().unwrap() = None;
+        if let Some(mut child) = self.stream.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.shared.stream_live.store(false, Ordering::SeqCst);
+    }
+
+    pub fn refresh_record(&mut self) {
+        if let Some(record) = self.record.as_mut() {
+            if record.try_wait().map(|s| s.is_some()).unwrap_or(true) {
+                self.shared.record_live.store(false, Ordering::SeqCst);
             }
         }
-        None => false,
+    }
+
+    pub fn refresh_stream(&mut self) {
+        if let Some(child) = self.stream.as_mut() {
+            let exited = child.try_wait().map(|s| s.is_some()).unwrap_or(true);
+            if exited || !self.shared.stream_live.load(Ordering::SeqCst) {
+                if !exited { let _ = child.kill(); let _ = child.wait(); }
+                self.shared.stream_live.store(false, Ordering::SeqCst);
+                *self.shared.stream_tx.lock().unwrap() = None;
+                self.stream = None;
+            }
+        }
+    }
+
+    pub fn retry_stream(&mut self, ffmpeg_path: &std::path::Path, source: &BroadcastConfig) -> Result<(), String> {
+        if !self.session_active() { return Err("Belum ada sesi siaran".into()); }
+        self.refresh_stream();
+        if self.shared.stream_live.load(Ordering::SeqCst) { return Err("Siaran sudah terhubung".into()); }
+        let (child, tx) = spawn_stream(ffmpeg_path, source, self.shared.stream_live.clone())?;
+        *self.shared.stream_tx.lock().unwrap() = Some(tx);
+        self.stream = Some(child);
+        Ok(())
     }
 }
 
-pub fn stop(mix: &Mutex<Option<RunningMix>>) {
+impl RunningMix {
+    pub fn finish_session(&mut self) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.session_active() { return Err("Belum ada sesi siaran".into()); }
+        self.session_started_at = None;
+        self.disconnect_stream();
+        *self.shared.record_tx.lock().unwrap() = None;
+        if let Some(writer) = self.record_writer.take() { let _ = writer.join(); }
+        self.shared.record_live.store(false, Ordering::SeqCst);
+        self.record_enabled = false;
+        if let Some(mut record) = self.record.take() {
+            let status = record.wait().map_err(|e| e.to_string())?;
+            let temp = self.recording_temp.take().ok_or("File sementara rekaman tidak ditemukan")?;
+            let final_path = self.recording_final.take().ok_or("Nama rekaman tidak ditemukan")?;
+            if !status.success() { return Err(format!("Encoder rekaman gagal. File sementara: {}", temp.display())); }
+            std::fs::rename(&temp, &final_path).map_err(|e| e.to_string())?;
+            return Ok(Some(final_path));
+        }
+        Ok(None)
+    }
+
+    pub fn stop_preview(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.guard.stop();
+        if let Some(mut loopback) = self.loopback.take() { loopback.stop(); }
+        if let Some(writer) = self.mix_writer.take() { let _ = writer.join(); }
+    }
+}
+
+pub fn stop(mix: &Mutex<Option<RunningMix>>) -> Result<Option<std::path::PathBuf>, String> {
     let mut slot = mix.lock().unwrap();
     if let Some(mut rm) = slot.take() {
-        rm.shared.stop.store(true, Ordering::SeqCst);
-        let _ = rm.ffmpeg.kill();
-        let _ = rm.ffmpeg.wait();
-        rm.guard.stop(); // stream capture/playback berhenti
+        let saved = if rm.session_active() { rm.finish_session() } else { Ok(None) };
+        rm.stop_preview();
+        return saved;
     }
+    Ok(None)
 }
 
-/// Start sesi penuh: input streams + FFmpeg encoder (PCM stdin → MP3 → Icecast)
-/// + monitor playback + writer thread mixing.
-pub fn start(
+fn pcm_command(ffmpeg_path: &std::path::Path, bitrate: u32) -> Command {
+    let mut command = Command::new(ffmpeg_path);
+    command.args(["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "44100", "-ac", "2",
+        "-i", "pipe:0", "-acodec", "libmp3lame", "-b:a", &format!("{bitrate}k"), "-f", "mp3"]);
+    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0800_0000);
+    command
+}
+
+fn spawn_stream(ffmpeg_path: &std::path::Path, source: &BroadcastConfig, live: Arc<AtomicBool>) -> Result<(Child, SyncSender<Vec<u8>>), String> {
+    let mut url = reqwest::Url::parse(&format!("icecast://{}:{}/{}", source.host, source.port, source.mount.trim_start_matches('/')))
+        .map_err(|_| "Alamat Icecast tidak valid".to_string())?;
+    url.set_username(&source.username).map_err(|_| "Username Icecast tidak valid".to_string())?;
+    url.set_password(Some(&source.password)).map_err(|_| "Password Icecast tidak valid".to_string())?;
+    let mut command = pcm_command(ffmpeg_path, source.bitrate_kbps);
+    command.args(["-content_type", "audio/mpeg", url.as_str()]);
+    let mut child = command.spawn().map_err(|e| format!("FFmpeg siaran gagal dijalankan: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("Pipe FFmpeg siaran gagal")?;
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    live.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        for bytes in rx {
+            if stdin.write_all(&bytes).is_err() { break; }
+        }
+        live.store(false, Ordering::SeqCst);
+    });
+    Ok((child, tx))
+}
+
+pub fn start_preview(
     cfg: &Config,
-    gains: (f32, f32, f32), // gain1, gain2, monitor (linear)
+    gains: (f32, f32, f32),
     routes: (u8, u8),
 ) -> Result<RunningMix, String> {
-    if cfg.device.is_empty() {
-        return Err("Input 1 belum dipilih".into());
-    }
-    if cfg.ice_password.is_empty() {
-        return Err("Password Icecast belum diisi (tab Pengaturan)".into());
+    if cfg.device.is_empty() { return Err("Input 1 belum dipilih".into()); }
+    if cfg.device2.as_deref() == Some(cfg.device.as_str()) { return Err("Input 1 dan 2 tidak boleh sama".into()); }
+    let desktop = cfg.device == crate::loopback::DEFAULT_OUTPUT || cfg.device2.as_deref() == Some(crate::loopback::DEFAULT_OUTPUT);
+    let mut monitor_block = None;
+    if desktop && !cfg.monitor_device.is_empty() {
+        let default_output = cpal::default_host().default_output_device().and_then(|d| d.name().ok());
+        if default_output.as_deref() == Some(cfg.monitor_device.as_str()) {
+            monitor_block = Some("Monitor Bus B memakai output yang sama dengan Desktop audio; pilih output lain".into());
+        }
     }
 
     let has2 = !cfg.device2.as_deref().unwrap_or("").is_empty();
     let shared = MixerShared::new(has2);
     {
         let mut p = shared.params.lock().unwrap();
-        p.gain1 = gains.0;
-        p.gain2 = gains.1;
-        p.monitor_gain = gains.2;
-        p.route1 = routes.0;
-        p.route2 = routes.1;
+        p.gain1 = gains.0; p.gain2 = gains.1; p.monitor_gain = gains.2;
+        p.route1 = routes.0; p.route2 = routes.1;
     }
-
-    // ---- streams dibangun di thread guard (affinity + non-Send) ----
     let name1 = cfg.device.clone();
     let name2 = cfg.device2.clone().unwrap_or_default();
     let mon_name = cfg.monitor_device.clone();
     let r1 = shared.ring1.clone();
     let r2 = shared.ring2.clone();
-    let rmon = shared.monitor.clone();
     let guard = StreamGuard::start(move || {
         let mut streams: Vec<Stream> = Vec::new();
-        let dev1 = find_input_device(&name1)?;
-        let s1 = make_input_stream(&dev1, &r1)?;
-        s1.play().map_err(|e| e.to_string())?;
-        streams.push(s1);
-        if !name2.is_empty() {
-            if name2 == name1 {
-                return Err("Input 1 dan Input 2 tidak boleh sama".into());
-            }
-            let dev2 = find_input_device(&name2)?;
-            let s2 = make_input_stream(&dev2, &r2)?;
-            s2.play().map_err(|e| e.to_string())?;
-            streams.push(s2);
+        if name1 != crate::loopback::DEFAULT_OUTPUT {
+            let dev1 = find_input_device(&name1)?;
+            let s1 = make_input_stream(&dev1, &r1).map_err(|e| describe_device_error("Input", &name1, e))?;
+            s1.play().map_err(|e| describe_device_error("Input", &name1, e.to_string()))?;
+            streams.push(s1);
         }
-        if !mon_name.is_empty() {
-            let odev = find_output_device(&mon_name)?;
-            let s = make_output_stream(&odev, &rmon)?;
-            s.play().map_err(|e| e.to_string())?;
-            streams.push(s);
+        if !name2.is_empty() {
+            if name2 != crate::loopback::DEFAULT_OUTPUT {
+                let dev2 = find_input_device(&name2)?;
+                let s2 = make_input_stream(&dev2, &r2).map_err(|e| describe_device_error("Input", &name2, e))?;
+                s2.play().map_err(|e| describe_device_error("Input", &name2, e.to_string()))?;
+                streams.push(s2);
+            }
         }
         Ok(streams)
-    })?;
+    }, mon_name, shared.monitor.clone(), shared.clone(), monitor_block)?;
+    let loopback = if desktop {
+        let ring = if cfg.device == crate::loopback::DEFAULT_OUTPUT { shared.ring1.clone() } else { shared.ring2.clone() };
+        Some(crate::loopback::LoopbackGuard::start(ring)?)
+    } else { None };
 
-    // ---- FFmpeg: PCM stdin -> MP3 -> Icecast ----
-    let url = format!(
-        "icecast://{}:{}@{}:{}/{}",
-        cfg.ice_username,
-        cfg.ice_password,
-        cfg.ice_host,
-        cfg.ice_port,
-        cfg.ice_mount.trim_start_matches('/')
-    );
-    let mut ffmpeg = Command::new(&cfg.ffmpeg_path)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-f", "s16le",
-            "-ar", "44100",
-            "-ac", "2",
-            "-i", "pipe:0",
-            "-af", "aresample=44100",
-            "-acodec", "libmp3lame",
-            "-b:a", &format!("{}k", cfg.bitrate),
-            "-ar", "44100",
-            "-ac", "2",
-            "-content_type", "audio/mpeg",
-            "-f", "mp3",
-            &url,
-        ])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000)
-        .spawn()
-        .map_err(|e| format!("Gagal menjalankan FFmpeg: {e}"))?;
-
-    let stdin = ffmpeg
-        .stdin
-        .take()
-        .ok_or("tidak bisa pegang stdin ffmpeg")?;
-
-    // writer thread: ring -> mix -> ffmpeg stdin + ring monitor
-    spawn_writer(&shared, stdin);
-
+    let mix_writer = spawn_writer(&shared);
     Ok(RunningMix {
-        ffmpeg,
-        shared,
-        guard,
+        shared, record_enabled: false, session_started_at: None,
+        device: cfg.device.clone(), device2: cfg.device2.clone(), monitor_device: cfg.monitor_device.clone(),
+        record: None, stream: None, record_writer: None, mix_writer: Some(mix_writer),
+        recording_temp: None, recording_final: None, guard, loopback,
     })
+}
+
+impl RunningMix {
+    pub fn start_session(
+        &mut self,
+        cfg: &Config,
+        ffmpeg_path: &std::path::Path,
+        source: &BroadcastConfig,
+        recording_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        if self.session_active() { return Err("Sesi sudah berjalan".into()); }
+        if cfg.record_enabled {
+            std::fs::create_dir_all(recording_dir).map_err(|e| format!("Folder rekaman: {e}"))?;
+            let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S_%3f");
+            let final_path = recording_dir.join(format!("8EH-Studio_{stamp}.mp3"));
+            let temp = recording_dir.join(format!("8EH-Studio_{stamp}.part.mp3"));
+            let mut command = pcm_command(ffmpeg_path, source.bitrate_kbps);
+            command.arg(&temp);
+            let mut record = command.spawn().map_err(|e| format!("FFmpeg rekaman gagal dijalankan: {e}"))?;
+            let mut record_stdin = record.stdin.take().ok_or("Pipe FFmpeg rekaman gagal")?;
+            let (record_tx, record_rx) = mpsc::sync_channel::<Vec<u8>>(512);
+            let record_live = self.shared.record_live.clone();
+            let writer = std::thread::spawn(move || {
+                for bytes in record_rx {
+                    if record_stdin.write_all(&bytes).is_err() { record_live.store(false, Ordering::SeqCst); break; }
+                }
+            });
+            self.record = Some(record);
+            self.record_writer = Some(writer);
+            self.recording_temp = Some(temp);
+            self.recording_final = Some(final_path);
+            self.shared.record_live.store(true, Ordering::SeqCst);
+            *self.shared.record_tx.lock().unwrap() = Some(record_tx);
+        }
+        self.record_enabled = cfg.record_enabled;
+        let (stream, tx) = match spawn_stream(ffmpeg_path, source, self.shared.stream_live.clone()) {
+            Ok((stream, tx)) => (Some(stream), Some(tx)),
+            Err(_) => (None, None),
+        };
+        self.stream = stream;
+        *self.shared.stream_tx.lock().unwrap() = tx;
+        self.session_started_at = Some(std::time::Instant::now());
+        Ok(())
+    }
 }
 
 /// Thread mixing: ring1+ring2 → (gain, route) → busA → ffmpeg stdin (s16)
 ///                                            → busB → ring monitor
-pub fn spawn_writer(shared: &Arc<MixerShared>, mut stdin: ChildStdin) {
+pub fn spawn_writer(shared: &Arc<MixerShared>) -> std::thread::JoinHandle<()> {
     let shared = shared.clone();
     std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        let mut last_tick = std::time::Instant::now();
+        let mut frame_fraction = 0.0f64;
         loop {
             if shared.stop.load(Ordering::SeqCst) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(16));
+            std::thread::sleep(Duration::from_millis(8));
+            let now = std::time::Instant::now();
+            let due = last_tick.elapsed().as_secs_f64().min(0.05) * RATE as f64 + frame_fraction;
+            last_tick = now;
+            let n = due.floor() as usize;
+            frame_fraction = due.fract();
+            if n == 0 { continue; }
 
             let p = *shared.params.lock().unwrap();
-            let (mut n1, mut n2) = (0usize, 0usize);
-            let mut seg1: Vec<f32> = Vec::new();
-            let mut seg2: Vec<f32> = Vec::new();
-            {
-                let q1 = shared.ring1.lock().unwrap();
-                n1 = q1.len() / 2;
-                if n1 > 0 {
-                    let it = q1.iter().take(n1 * 2);
-                    seg1 = it.cloned().collect();
-                }
-            }
-            if shared.has2 {
-                let q2 = shared.ring2.lock().unwrap();
-                n2 = q2.len() / 2;
-                if n2 > 0 {
-                    let it = q2.iter().take(n2 * 2);
-                    seg2 = it.cloned().collect();
-                }
-            }
-            let n = if shared.has2 { n1.min(n2) } else { n1 };
-            if n == 0 {
-                continue;
-            }
-            // buang sisa frame yang tidak ter-campur (align kedua ring)
-            {
-                let mut q1 = shared.ring1.lock().unwrap();
-                for _ in 0..n * 2 {
-                    q1.pop_front();
-                }
-            }
-            if shared.has2 {
-                let mut q2 = shared.ring2.lock().unwrap();
-                for _ in 0..n * 2 {
-                    q2.pop_front();
-                }
-            }
+            let seg1 = take_or_silence(&shared.ring1, n);
+            let seg2 = if shared.has2 { take_or_silence(&shared.ring2, n) } else { vec![0.0; n * 2] };
 
             buf.clear();
             let mut sum_sq = [0f64; 4];
+            let mut clipped = [false; 2];
             let mut mon = Vec::with_capacity(n * 2);
             for i in 0..n {
-                let l1 = if n1 > i { seg1[i * 2] * p.gain1 } else { 0.0 };
-                let r1 = if n1 > i { seg1[i * 2 + 1] * p.gain1 } else { 0.0 };
-                let l2 = if shared.has2 && n2 > i { seg2[i * 2] * p.gain2 } else { 0.0 };
-                let r2 = if shared.has2 && n2 > i { seg2[i * 2 + 1] * p.gain2 } else { 0.0 };
+                let l1 = seg1[i * 2] * p.gain1;
+                let r1 = seg1[i * 2 + 1] * p.gain1;
+                let l2 = seg2[i * 2] * p.gain2;
+                let r2 = seg2[i * 2 + 1] * p.gain2;
 
                 // meter input post-fader
                 sum_sq[0] += (l1 * l1 + r1 * r1) as f64;
@@ -478,6 +630,8 @@ pub fn spawn_writer(shared: &Arc<MixerShared>, mut stdin: ChildStdin) {
 
                 sum_sq[2] += (la * la + ra * ra) as f64;
                 sum_sq[3] += (lb * lb + rb * rb) as f64;
+                clipped[0] |= la.abs() >= 1.0 || ra.abs() >= 1.0;
+                clipped[1] |= (lb * p.monitor_gain).abs() >= 1.0 || (rb * p.monitor_gain).abs() >= 1.0;
 
                 let clamp = |v: f32| v.clamp(-1.0, 1.0);
                 // bus A → s16 LE ke ffmpeg
@@ -498,16 +652,35 @@ pub fn spawn_writer(shared: &Arc<MixerShared>, mut stdin: ChildStdin) {
                     m[idx] = rms;
                 }
             }
+            if clipped[0] || clipped[1] {
+                let mut last = shared.last_clip.lock().unwrap();
+                for i in 0..2 { if clipped[i] { last[i] = Some(std::time::Instant::now()); } }
+            }
 
             push_frames(&shared.monitor, &mon.chunks(2).map(|c| (c[0], c[1])).collect::<Vec<_>>());
-            if stdin.write_all(&buf).is_err() {
-                eprintln!("encoder terputus");
-                shared.stop.store(true, Ordering::SeqCst);
-                break;
+            let record = shared.record_tx.lock().unwrap().as_ref().cloned();
+            if let Some(tx) = record {
+                match tx.try_send(buf.clone()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => { shared.record_live.store(false, Ordering::SeqCst); }
+                    Err(TrySendError::Disconnected(_)) => {
+                        *shared.record_tx.lock().unwrap() = None;
+                        shared.record_live.store(false, Ordering::SeqCst);
+                    }
+                }
             }
-            let _ = stdin.flush();
+            let mut stream = shared.stream_tx.lock().unwrap();
+            if let Some(tx) = stream.as_ref() {
+                match tx.try_send(buf.clone()) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => {
+                        *stream = None;
+                        shared.stream_live.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
         }
-    });
+    })
 }
 
 // ---------- stream builder per sample format ----------
@@ -525,11 +698,12 @@ fn make_input_stream(
     match cfg.sample_format() {
         SampleFormat::F32 => {
             let cb_ring = ring.clone();
+            let mut resampler = InputResampler::new();
             device
                 .build_input_stream(
                     &scfg,
                     move |data: &[f32], _| {
-                        let frames = to_frames(data.iter().copied(), ch, rate);
+                        let frames = to_frames(data.iter().copied(), ch, rate, &mut resampler);
                         push_frames(&cb_ring, &frames);
                     },
                     |err| eprintln!("input err: {err}"),
@@ -539,11 +713,12 @@ fn make_input_stream(
         }
         SampleFormat::I16 => {
             let cb_ring = ring.clone();
+            let mut resampler = InputResampler::new();
             device
                 .build_input_stream(
                     &scfg,
                     move |data: &[i16], _| {
-                        let frames = to_frames(data.iter().map(|s| f32::from_sample(*s)), ch, rate);
+                        let frames = to_frames(data.iter().map(|s| f32::from_sample(*s)), ch, rate, &mut resampler);
                         push_frames(&cb_ring, &frames);
                     },
                     |err| eprintln!("input err: {err}"),
@@ -553,6 +728,7 @@ fn make_input_stream(
         }
         SampleFormat::U16 => {
             let cb_ring = ring.clone();
+            let mut resampler = InputResampler::new();
             device
                 .build_input_stream(
                     &scfg,
@@ -562,6 +738,7 @@ fn make_input_stream(
                                 .map(|s| f32::from_sample(*s)),
                             ch,
                             rate,
+                            &mut resampler,
                         );
                         push_frames(&cb_ring, &frames);
                     },
@@ -587,10 +764,11 @@ fn make_output_stream(
     match cfg.sample_format() {
         SampleFormat::F32 => {
             let cb_ring = ring.clone();
+            let mut resampler = OutputResampler::new(rate);
             device
                 .build_output_stream(
                     &scfg,
-                    move |data: &mut [f32], _| fill_output(data, &cb_ring, ch, rate),
+                    move |data: &mut [f32], _| fill_output(data, &cb_ring, ch, &mut resampler),
                     |err| eprintln!("output err: {err}"),
                     None,
                 )
@@ -598,13 +776,14 @@ fn make_output_stream(
         }
         SampleFormat::I16 => {
             let cb_ring = ring.clone();
+            let mut resampler = OutputResampler::new(rate);
             device
                 .build_output_stream(
                     &scfg,
                     move |data: &mut [i16], _| {
                         let nf = data.len();
                         let mut tmp = vec![0f32; nf];
-                        fill_output(&mut tmp, &cb_ring, ch, rate);
+                        fill_output(&mut tmp, &cb_ring, ch, &mut resampler);
                         for (o, s) in data.iter_mut().zip(tmp.iter()) {
                             *o = i16::from_sample(*s);
                         }
@@ -616,13 +795,14 @@ fn make_output_stream(
         }
         SampleFormat::U16 => {
             let cb_ring = ring.clone();
+            let mut resampler = OutputResampler::new(rate);
             device
                 .build_output_stream(
                     &scfg,
                     move |data: &mut [u16], _| {
                         let nf = data.len();
                         let mut tmp = vec![0f32; nf];
-                        fill_output(&mut tmp, &cb_ring, ch, rate);
+                        fill_output(&mut tmp, &cb_ring, ch, &mut resampler);
                         for (o, s) in data.iter_mut().zip(tmp.iter()) {
                             *o = u16::from_sample(*s);
                         }
@@ -636,49 +816,75 @@ fn make_output_stream(
     }
 }
 
-/// Ambil sampel dari ring monitor, resample ke rate output, sebar ke channel.
-fn fill_output(data: &mut [f32], ring: &Arc<Mutex<VecDeque<f32>>>, ch: usize, rate: f32) {
-    let need = if (rate - RATE).abs() < 1.0 {
-        data.len() / ch.max(1)
-    } else {
-        ((data.len() as f32 / ch as f32) * (rate / RATE)).ceil() as usize
-    };
-    let mut got: Vec<f32> = Vec::with_capacity(need * 2);
-    {
-        let mut q = ring.lock().unwrap();
-        let mut take = need * 2;
-        if take > q.len() {
-            take = q.len();
-        }
-        while take > 0 {
-            got.push(q.pop_front().unwrap_or(0.0));
-            take -= 1;
-        }
+struct OutputResampler {
+    step: f64,
+    phase: f64,
+    current: (f32, f32),
+    next: (f32, f32),
+    ready: bool,
+}
+
+impl OutputResampler {
+    fn new(output_rate: f32) -> Self {
+        Self { step: RATE as f64 / output_rate as f64, phase: 0.0, current: (0.0, 0.0), next: (0.0, 0.0), ready: false }
     }
-    // stereo interleaved → sebar ke semua channel output
-    let frames = got.len() / 2;
-    for (i, out) in data.iter_mut().enumerate() {
-        let f = i / ch;
-        let side = i % ch;
-        let (l, r) = if f < frames {
-            (got[f * 2], got[f * 2 + 1])
-        } else {
-            (0.0, 0.0)
-        };
-        *out = match (ch, side) {
-            (1, _) => (l + r) * 0.5,
-            (_, 0) => l,
-            (_, 1) => r,
-            _ => (l + r) * 0.5,
-        };
+
+    fn pop(q: &mut VecDeque<f32>) -> Option<(f32, f32)> {
+        if q.len() < 2 { return None; }
+        Some((q.pop_front()?, q.pop_front()?))
+    }
+
+    fn frame(&mut self, q: &mut VecDeque<f32>) -> (f32, f32) {
+        if !self.ready {
+            if q.len() < (RATE as usize / 50) * 2 { return (0.0, 0.0); }
+            self.current = Self::pop(q).unwrap_or((0.0, 0.0));
+            self.next = Self::pop(q).unwrap_or(self.current);
+            self.phase = 0.0;
+            self.ready = true;
+        }
+        let t = self.phase as f32;
+        let value = (
+            self.current.0 + (self.next.0 - self.current.0) * t,
+            self.current.1 + (self.next.1 - self.current.1) * t,
+        );
+        self.phase += self.step;
+        while self.phase >= 1.0 {
+            self.phase -= 1.0;
+            self.current = self.next;
+            if let Some(next) = Self::pop(q) { self.next = next; }
+            else { self.ready = false; break; }
+        }
+        value
+    }
+}
+
+/// Ambil 44,1 kHz dari ring monitor dengan fase kontinu, lalu sebar ke channel output.
+fn fill_output(data: &mut [f32], ring: &Arc<Mutex<VecDeque<f32>>>, ch: usize, resampler: &mut OutputResampler) {
+    let mut q = ring.lock().unwrap();
+    if q.len() > (RATE as usize / 7) * 2 {
+        let excess = ((q.len() - (RATE as usize / 20) * 2) / 2) * 2;
+        for _ in 0..excess { q.pop_front(); }
+        resampler.ready = false;
+    }
+    for frame in data.chunks_mut(ch.max(1)) {
+        let (l, r) = resampler.frame(&mut q);
+        for (side, out) in frame.iter_mut().enumerate() {
+            *out = match (ch, side) {
+                (1, _) => (l + r) * 0.5,
+                (_, 0) => l,
+                (_, 1) => r,
+                _ => (l + r) * 0.5,
+            };
+        }
     }
 }
 
 /// interleaved mentah (ch berapapun) → frames stereo 44.1k
-fn to_frames<I: Iterator<Item = f32>>(
+pub(crate) fn to_frames<I: Iterator<Item = f32>>(
     samples: I,
     ch: usize,
     rate: f32,
+    resampler: &mut InputResampler,
 ) -> Vec<(f32, f32)> {
     let raw: Vec<f32> = samples.collect();
     let mut stereo: Vec<(f32, f32)> = Vec::with_capacity(raw.len() / ch.max(1));
@@ -688,5 +894,49 @@ fn to_frames<I: Iterator<Item = f32>>(
         let r = frame.get(1).copied().unwrap_or(l);
         stereo.push((l, r));
     }
-    resample_stereo(&stereo, rate)
+    resampler.process(&stereo, rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn crossings(samples: &[f32]) -> usize {
+        samples.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count()
+    }
+
+    #[test]
+    fn input_resampling_keeps_pitch_across_irregular_callbacks() {
+        let mut resampler = InputResampler::new();
+        let source: Vec<(f32, f32)> = (0..48_000).map(|i| {
+            let value = (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin();
+            (value, value)
+        }).collect();
+        let result: Vec<f32> = source.chunks(97)
+            .flat_map(|chunk| resampler.process(chunk, 48_000.0))
+            .map(|frame| frame.0).collect();
+        assert!((result.len() as isize - 44_100).abs() <= 2);
+        assert!((crossings(&result) as isize - 440).abs() <= 2);
+    }
+
+    #[test]
+    fn monitor_resampling_keeps_pitch_at_48khz() {
+        let mut ring = VecDeque::new();
+        for i in 0..44_100 {
+            let value = (std::f32::consts::TAU * 440.0 * i as f32 / 44_100.0).sin();
+            ring.push_back(value);
+            ring.push_back(value);
+        }
+        let mut resampler = OutputResampler::new(48_000.0);
+        let output: Vec<f32> = (0..48_000).map(|_| resampler.frame(&mut ring).0).collect();
+        assert!((crossings(&output) as isize - 440).abs() <= 2);
+    }
+
+    #[test]
+    fn empty_second_input_does_not_hold_first_input() {
+        let first = Mutex::new(VecDeque::from(vec![0.5; 882]));
+        let second = Mutex::new(VecDeque::new());
+        assert_eq!(take_or_silence(&first, 441)[0], 0.5);
+        assert!(take_or_silence(&second, 441).iter().all(|sample| *sample == 0.0));
+    }
 }
