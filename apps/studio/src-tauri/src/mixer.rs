@@ -450,7 +450,9 @@ fn pcm_command(ffmpeg_path: &std::path::Path, bitrate: u32) -> Command {
     let mut command = Command::new(ffmpeg_path);
     command.args(["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "44100", "-ac", "2",
         "-i", "pipe:0", "-acodec", "libmp3lame", "-b:a", &format!("{bitrate}k"), "-f", "mp3"]);
-    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0800_0000);
+    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     command
 }
 

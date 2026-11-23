@@ -283,6 +283,12 @@
           cfg.record_enabled = $("record-enabled").checked;
           await invoke("save_config", { config: cfg });
           await ensurePreview();
+          if (navigator.platform.startsWith("Mac")) {
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            const level = await invoke("get_broadcast_status");
+            if (level.meters_db[0] <= -80 && level.meters_db[1] <= -80 &&
+                !confirm("Belum ada sinyal audio terdeteksi. Periksa izin Microphone atau Screen Recording dan pilihan input. Tetap mulai sesi?")) return;
+          }
           await invoke("start_broadcast");
           feedback("broadcast-feedback", cfg.record_enabled ? "Sesi dimulai. Rekaman berjalan." : "Sesi siaran dimulai tanpa rekaman.", "ok");
         }
@@ -539,7 +545,8 @@
         }
         for (const d of list) {
           const o = document.createElement("option");
-          o.value = d; o.textContent = d === "desktop:default" ? "Desktop audio · output default Windows" : d;
+          o.value = d; o.textContent = d === "desktop:default"
+            ? (navigator.platform.startsWith("Mac") ? "Desktop audio · output Mac" : "Desktop audio · output default Windows") : d;
           if (d === cur) o.selected = true;
           sel.appendChild(o);
         }
