@@ -49,8 +49,12 @@ jobs:
       - name: Verify DMG and app resources
         working-directory: apps/studio/src-tauri
         run: |
-          test -f target/release/bundle/dmg/*.dmg
-          app="$(find target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          dmg="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -f "$dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"; rmdir "$mount"' EXIT
+          app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
           test -n "$app"
           test -x "$app/Contents/Resources/ffmpeg"
           test -x "$app/Contents/Resources/desktop-capture"
