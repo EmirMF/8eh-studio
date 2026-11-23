@@ -986,12 +986,10 @@ fn main() {
             get_metadata_status
         ])
         .setup(|app| {
+            #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main") {
                 let icon = tauri::image::Image::from_app_icon_resource(128)?;
-                #[cfg(windows)]
                 window.set_icon(icon)?;
-                #[cfg(target_os = "macos")]
-                let _ = icon;
             }
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
