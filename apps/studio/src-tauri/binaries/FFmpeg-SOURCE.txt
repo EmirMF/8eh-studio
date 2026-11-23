@@ -3,3 +3,7 @@ Upstream source commit: https://github.com/FFmpeg/FFmpeg/commit/bf1b838f2a
 Build distribution: https://www.gyan.dev/ffmpeg/builds/
 FFmpeg copyright, build configuration, and license details are in
 FFmpeg-README.txt and FFmpeg-LICENSE.txt beside this file.
+
+macOS builds: Martin Riedl FFmpeg 9.1 static build, Intel and Apple Silicon.
+Build source: https://ffmpeg.martin-riedl.de/
+The macOS CI downloads the pinned archives and verifies their SHA-256 files.

@@ -1,0 +1,16 @@
+{
+  "bundle": {
+    "targets": ["dmg"],
+    "resources": {
+      "binaries/macos/ffmpeg": "ffmpeg",
+      "binaries/macos/desktop-capture": "desktop-capture",
+      "binaries/FFmpeg-LICENSE.txt": "FFmpeg-LICENSE.txt",
+      "binaries/FFmpeg-SOURCE.txt": "FFmpeg-SOURCE.txt"
+    },
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-"
+    },
+    "icon": ["icons/icon.icns", "icons/128x128.png"]
+  }
+}

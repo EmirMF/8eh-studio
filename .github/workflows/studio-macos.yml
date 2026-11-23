@@ -1,0 +1,66 @@
+name: Studio macOS
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'apps/studio/**'
+      - '.github/workflows/studio-macos.yml'
+  pull_request:
+    paths:
+      - 'apps/studio/**'
+      - '.github/workflows/studio-macos.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/studio/src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/studio/package-lock.json
+      - name: Prepare native macOS resources
+        working-directory: apps/studio/src-tauri
+        run: bash macos/prepare.sh
+      - name: Test Rust logic
+        working-directory: apps/studio/src-tauri
+        run: cargo test --locked
+      - name: Install Tauri CLI
+        working-directory: apps/studio
+        run: npm ci
+      - name: Build DMG
+        working-directory: apps/studio
+        run: npm run tauri -- build
+      - name: Verify DMG and app resources
+        working-directory: apps/studio/src-tauri
+        run: |
+          dmg="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -f "$dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"; rmdir "$mount"' EXIT
+          app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          test -x "$app/Contents/Resources/ffmpeg"
+          test -x "$app/Contents/Resources/desktop-capture"
+          file "$app/Contents/MacOS/studio" "$app/Contents/Resources/ffmpeg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 8EH-Studio-macOS-${{ matrix.arch }}
+          path: apps/studio/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

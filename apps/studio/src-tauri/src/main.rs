@@ -1,6 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mixer;
+#[cfg(windows)]
+#[path = "loopback.rs"]
+mod loopback;
+#[cfg(target_os = "macos")]
+#[path = "loopback_macos.rs"]
 mod loopback;
 
 use mixer::RunningMix;
@@ -10,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(windows)]
 use windows::Media::Control as smtc;
 
 // konversi dB → linear (UI kirim dB, mixer pakai linear)
@@ -60,8 +66,17 @@ impl Default for Config {
 }
 
 fn config_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("Library/Application Support/com.eighteh.studio");
+    }
+    #[cfg(windows)]
+    {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     std::path::PathBuf::from(appdata).join("com.eighteh.studio")
+    }
 }
 
 fn load_config_file() -> Config {
@@ -184,6 +199,7 @@ fn artwork_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[cfg(windows)]
 fn read_artwork(props: &smtc::GlobalSystemMediaTransportControlsSessionMediaProperties) -> Option<Artwork> {
     let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.get().ok()?;
     let size = stream.Size().ok()?;
@@ -207,6 +223,7 @@ fn read_artwork(props: &smtc::GlobalSystemMediaTransportControlsSessionMediaProp
     })
 }
 
+#[cfg(windows)]
 fn read_playback() -> Option<Playback> {
     let manager = smtc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .ok()?
@@ -253,6 +270,29 @@ fn read_playback() -> Option<Playback> {
         playing,
         artwork: if playing { read_artwork(&props) } else { None },
     })
+}
+
+#[cfg(target_os = "macos")]
+fn read_playback() -> Option<Playback> {
+    #[derive(Deserialize)]
+    struct MacTrack { title: String, artist: String, playing: bool, artwork_url: Option<String> }
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", include_str!("metadata_macos.js")])
+        .output().ok()?;
+    if !output.status.success() { return None; }
+    let track: MacTrack = serde_json::from_slice(&output.stdout).ok()?;
+    let artwork = track.artwork_url.and_then(|url| {
+        let response = reqwest::blocking::Client::builder().timeout(Duration::from_secs(2)).build().ok()?
+            .get(url).send().ok()?;
+        if !response.status().is_success() || response.content_length().unwrap_or(0) > MAX_ARTWORK_BYTES { return None; }
+        let bytes = response.bytes().ok()?;
+        if bytes.len() as u64 > MAX_ARTWORK_BYTES { return None; }
+        let mime_type = artwork_mime(&bytes)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Some(Artwork { mime_type, data: base64::engine::general_purpose::STANDARD.encode(&bytes), fingerprint: hasher.finish() })
+    });
+    Some(Playback { title: track.title, artist: track.artist, playing: track.playing, artwork })
 }
 
 fn send_post(client: &reqwest::blocking::Client, cfg: &Config, body: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -537,7 +577,9 @@ fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
     rand::thread_rng().fill_bytes(&mut bytes);
     let attempt: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into());
+    let computer = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "8EH Studio".into());
     let mut link_url = reqwest::Url::parse(&format!("{}/studio-link", cfg.url.trim_end_matches('/')))
         .map_err(|_| "URL situs tidak valid".to_string())?;
     link_url.query_pairs_mut()
@@ -560,6 +602,9 @@ fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
             return Err("Windows tidak dapat membuka browser default untuk login".into());
         }
     }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("/usr/bin/open").arg(link_url.as_str())
+        .spawn().map_err(|e| format!("Browser tidak dapat dibuka: {e}"))?;
     {
         let cfg_state = app.state::<Mutex<Config>>();
         let mut current = cfg_state.lock().unwrap();
@@ -663,8 +708,14 @@ fn list_output_devices() -> Vec<String> {
 }
 
 fn bundled_ffmpeg(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let bundled = app.path().resource_dir().map_err(|e| e.to_string())?.join("ffmpeg.exe");
+    let bundled = app.path().resource_dir().map_err(|e| e.to_string())?
+        .join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
     if bundled.is_file() { return Ok(bundled); }
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    {
+        let local = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/macos/ffmpeg");
+        if local.is_file() { return Ok(local); }
+    }
     #[cfg(debug_assertions)]
     { return Ok(std::path::PathBuf::from("ffmpeg")); }
     #[cfg(not(debug_assertions))]
@@ -768,7 +819,8 @@ fn stop_broadcast(app: AppHandle) -> Result<Option<String>, String> {
 fn open_recording_folder(app: AppHandle) -> Result<(), String> {
     let path = app.path().audio_dir().map_err(|e| e.to_string())?.join("8EH");
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-    std::process::Command::new("explorer.exe").arg(path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(if cfg!(windows) { "explorer.exe" } else { "open" })
+        .arg(path).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -934,6 +986,7 @@ fn main() {
             get_metadata_status
         ])
         .setup(|app| {
+            #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main") {
                 let icon = tauri::image::Image::from_app_icon_resource(128)?;
                 window.set_icon(icon)?;
