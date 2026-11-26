@@ -2,6 +2,7 @@
 
 mod mixer;
 mod obs;
+mod session_checks;
 #[cfg(windows)]
 #[path = "loopback.rs"]
 mod loopback;
@@ -10,11 +11,12 @@ mod loopback;
 mod loopback;
 
 use mixer::{IcecastStatus, RunningMix};
+use session_checks::SessionChecks;
 use serde::{Deserialize, Serialize};
 use base64::Engine as _;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(windows)]
 use windows::Media::Control as smtc;
@@ -38,7 +40,7 @@ struct Config {
     device_id: String,   // identitas per instalasi app (rahasia perangkat)
     logged_user: String,
     scope: String,       // "broadcast" | "metadata" | "" (belum login)
-    metadata_on: bool,  // bisa dimatikan dari dashboard (sinkron tiap heartbeat)
+    metadata_on: bool,  // bisa dimatikan dari dashboard (sinkron lewat pengecekan sesi)
     metadata_source: String,
     obs_port: Option<u16>,
     obs_tiktok_output: Option<String>,
@@ -603,7 +605,14 @@ fn device_get(cfg: &Config, route: &str) -> Result<reqwest::blocking::Response, 
         .map_err(|e| format!("Tidak dapat menghubungi situs: {e}"))
 }
 
-fn fetch_broadcast_config(cfg: &Config) -> Result<BroadcastConfig, String> {
+async fn fetch_broadcast_config(cfg: &Config) -> Result<BroadcastConfig, String> {
+    let cfg = cfg.clone();
+    tauri::async_runtime::spawn_blocking(move || request_broadcast_config(&cfg))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn request_broadcast_config(cfg: &Config) -> Result<BroadcastConfig, String> {
     let response = device_get(cfg, "/api/studio/broadcast-config")?;
     match response.status().as_u16() {
         401 => return Err("Login perangkat tidak berlaku. Login ulang.".into()),
@@ -621,38 +630,127 @@ fn fetch_broadcast_config(cfg: &Config) -> Result<BroadcastConfig, String> {
     Ok(source)
 }
 
-#[tauri::command]
-fn validate_login(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<Mutex<Config>>();
-    let cfg = state.lock().unwrap().clone();
-    if cfg.token.is_empty() { return Ok(serde_json::json!({"status":"login"})); }
-    let requested_token = cfg.token.clone();
-    let requested_url = cfg.url.clone();
-    let response = device_get(&cfg, "/api/studio/session")?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionDetails {
+    scope: String,
+    user: SessionUser,
+    metadata_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct SessionUser {
+    name: String,
+}
+
+fn fetch_session(cfg: &Config) -> Result<Option<SessionDetails>, String> {
+    let response = device_get(cfg, "/api/studio/session")?;
     if response.status().as_u16() == 401 {
-        let mut cfg = state.lock().unwrap();
-        if cfg.token != requested_token || cfg.url != requested_url {
-            return Ok(serde_json::json!({"status":"login"}));
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    response.json().map(Some).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn session_checks_use_authenticated_requests_and_distinguish_revocation_from_failure() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cfg = Config {
+        url: format!("http://{}", server.local_addr().unwrap()),
+        token: "test-device-token".into(),
+        ..Config::default()
+    };
+    let responses = [
+        ("200 OK", r#"{"user":{"name":"Kru"},"scope":"metadata","metadataEnabled":true}"#),
+        ("401 Unauthorized", "{}"),
+        ("503 Service Unavailable", "{}"),
+    ];
+    let site = std::thread::spawn(move || {
+        for (status, body) in responses {
+            let (mut connection, _) = server.accept().unwrap();
+            let mut request = BufReader::new(&connection).lines().map(Result::unwrap);
+            assert_eq!(request.next().as_deref(), Some("GET /api/studio/session HTTP/1.1"));
+            assert!(request.take_while(|line| !line.is_empty()).any(|line| {
+                line.eq_ignore_ascii_case("x-device-token: test-device-token")
+            }));
+            write!(connection, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
-        cfg.token.clear(); cfg.scope.clear(); cfg.logged_user.clear();
-        persist_config(&cfg);
-        suspend_audio_for_access(&app);
-        return Ok(serde_json::json!({"status":"login"}));
+    });
+
+    let approved = fetch_session(&cfg).unwrap().unwrap();
+    assert_eq!(approved.user.name, "Kru");
+    assert_eq!(approved.scope, "metadata");
+    assert!(approved.metadata_enabled);
+    assert!(fetch_session(&cfg).unwrap().is_none());
+    assert_eq!(fetch_session(&cfg).err().as_deref(), Some("HTTP 503 Service Unavailable"));
+    site.join().unwrap();
+}
+
+fn check_device_session(app: &AppHandle, immediate: bool) {
+    let configs = app.state::<Mutex<Config>>();
+    let checks = app.state::<Mutex<SessionChecks>>();
+    let requested = {
+        let cfg = configs.lock().unwrap();
+        let running = app.state::<Mutex<Option<RunningMix>>>().lock().unwrap()
+            .as_ref().is_some_and(RunningMix::session_active);
+        if !checks.lock().unwrap().begin(Instant::now(), &cfg.url, &cfg.token, running, immediate) {
+            if immediate && cfg.token.is_empty() {
+                let _ = app.emit("device-session-checked", serde_json::json!({"status": "login"}));
+            }
+            return;
+        }
+        cfg.clone()
+    };
+
+    let result = fetch_session(&requested);
+    let mut cfg = configs.lock().unwrap();
+    if cfg.token == requested.token && cfg.url == requested.url {
+        let event = match result {
+            Ok(Some(details)) => {
+                if cfg.scope != details.scope || cfg.logged_user != details.user.name
+                    || cfg.metadata_on != details.metadata_enabled
+                {
+                    cfg.scope = details.scope;
+                    cfg.logged_user = details.user.name;
+                    cfg.metadata_on = details.metadata_enabled;
+                    persist_config(&cfg);
+                }
+                if cfg.scope != "broadcast" {
+                    suspend_audio_for_access(app);
+                }
+                serde_json::json!({"status": "approved"})
+            }
+            Ok(None) => {
+                clear_device_session(&mut cfg);
+                persist_config(&cfg);
+                suspend_audio_for_access(app);
+                serde_json::json!({"status": "revoked"})
+            }
+            Err(error) => serde_json::json!({"status": "error", "message": error}),
+        };
+        let _ = app.emit("device-session-checked", event);
     }
-    if !response.status().is_success() { return Err(format!("HTTP {}", response.status())); }
-    let data: serde_json::Value = response.json().map_err(|e| e.to_string())?;
-    let mut cfg = state.lock().unwrap();
-    if cfg.token != requested_token || cfg.url != requested_url {
-        return Ok(serde_json::json!({"status":"login"}));
-    }
-    cfg.scope = data["scope"].as_str().unwrap_or("").to_string();
-    cfg.logged_user = data["user"]["name"].as_str().unwrap_or("Kru 8EH").to_string();
-    cfg.metadata_on = data["metadataEnabled"].as_bool().unwrap_or(false);
-    persist_config(&cfg);
-    if cfg.scope != "broadcast" {
-        suspend_audio_for_access(&app);
-    }
-    Ok(serde_json::json!({"status":"approved", "scope":cfg.scope}))
+    checks.lock().unwrap().finish();
+}
+
+fn clear_device_session(cfg: &mut Config) {
+    cfg.token.clear();
+    cfg.scope.clear();
+    cfg.logged_user.clear();
+    cfg.metadata_on = false;
+}
+
+#[tauri::command]
+async fn validate_login(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || check_device_session(&app, true))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 impl BroadcastUi {
@@ -674,11 +772,13 @@ fn linear_to_db(lin: f32) -> f32 {
 
 fn suspend_audio_for_access(app: &AppHandle) {
     let mix = app.state::<Mutex<Option<RunningMix>>>();
-    let active = mix.lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false);
-    if active {
-        if let Some(rm) = mix.lock().unwrap().as_mut() { rm.disconnect_stream(); }
-    } else {
-        let _ = mixer::stop(&mix);
+    let mut slot = mix.lock().unwrap();
+    if let Some(rm) = slot.as_mut() {
+        if rm.session_active() {
+            rm.disconnect_stream();
+        } else if let Some(mut preview) = slot.take() {
+            preview.stop_preview();
+        }
     }
 }
 
@@ -735,14 +835,13 @@ fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "macos")]
     std::process::Command::new("/usr/bin/open").arg(link_url.as_str())
         .spawn().map_err(|e| format!("Browser tidak dapat dibuka: {e}"))?;
-    {
-        let cfg_state = app.state::<Mutex<Config>>();
-        let mut current = cfg_state.lock().unwrap();
-        current.token.clear();
-        current.scope.clear();
-        current.logged_user.clear();
-        persist_config(&current);
+    let cfg_state = app.state::<Mutex<Config>>();
+    let mut current = cfg_state.lock().unwrap();
+    if current.url != cfg.url || current.device_id != cfg.device_id {
+        return Err("Alamat situs berubah. Mulai login lagi.".into());
     }
+    clear_device_session(&mut current);
+    persist_config(&current);
     *app.state::<Mutex<Option<String>>>().lock().unwrap() = Some(attempt);
 
     Ok(serde_json::json!({ "opened": true, "linkUrl": link_url.as_str() }))
@@ -752,40 +851,40 @@ fn login_google(app: AppHandle) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
     let cfg_state = app.state::<Mutex<Config>>();
-    let cfg = cfg_state.lock().unwrap().clone();
-    if cfg.url.is_empty() || cfg.device_id.is_empty() {
-        return Ok(serde_json::json!({ "status": "notfound" }));
-    }
-    let attempt = match app.state::<Mutex<Option<String>>>().lock().unwrap().clone() {
-        Some(attempt) => attempt,
-        None => return Ok(serde_json::json!({ "status": "notfound" })),
+    let pending = app.state::<Mutex<Option<String>>>();
+    let (url, attempt) = {
+        let cfg = cfg_state.lock().unwrap();
+        let pending = pending.lock().unwrap();
+        match pending.as_ref() {
+            Some(attempt) => (cfg.url.clone(), attempt.clone()),
+            None => return Ok(serde_json::json!({ "status": "notfound" })),
+        }
     };
-    let url = format!(
-        "{}/api/studio/link-status?sid={}",
-        cfg.url.trim_end_matches('/'),
-        attempt
-    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get(&url)
+        .get(format!("{}/api/studio/link-status?sid={attempt}", url.trim_end_matches('/')))
         .send()
         .map_err(|e| e.to_string())?;
     if !resp.status().is_success() { return Err(format!("HTTP {}", resp.status())); }
     let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
 
-    // approved → simpan token + scope
+    let mut cfg = cfg_state.lock().unwrap();
+    let mut pending = pending.lock().unwrap();
+    if cfg.url != url || pending.as_deref() != Some(attempt.as_str()) {
+        return Ok(serde_json::json!({ "status": "notfound" }));
+    }
+
     if json["status"] == "approved" {
         let token = json["token"].as_str().unwrap_or("").to_string();
         let scope = json["scope"].as_str().unwrap_or("").to_string();
         let name = json["user"]["name"].as_str().unwrap_or("Kru 8EH").to_string();
         if token.is_empty() {
+            *pending = None;
             return Ok(serde_json::json!({ "status": "revoked" }));
         }
-        let cfg_state = app.state::<Mutex<Config>>();
-        let mut cfg = cfg_state.lock().unwrap();
         cfg.token = token;
         cfg.scope = scope;
         cfg.logged_user = name;
@@ -793,7 +892,7 @@ fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
         persist_config(&cfg);
     }
     if matches!(json["status"].as_str(), Some("approved" | "denied" | "revoked")) {
-        *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
+        *pending = None;
     }
     Ok(json)
 }
@@ -801,16 +900,14 @@ fn link_status(app: AppHandle) -> Result<serde_json::Value, String> {
 /// Logout lokal (hapus token; device tetap terdaftar di server sampai dicabut).
 #[tauri::command]
 fn logout(app: AppHandle) {
-    *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
     let cfg_state = app.state::<Mutex<Config>>();
     let mut cfg = cfg_state.lock().unwrap();
-    cfg.token.clear();
-    cfg.scope.clear();
-    cfg.logged_user.clear();
+    *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
+    clear_device_session(&mut cfg);
     persist_config(&cfg);
+    suspend_audio_for_access(&app);
     drop(cfg);
     obs::disconnect(&app);
-    suspend_audio_for_access(&app);
 }
 
 // ============================================================
@@ -823,8 +920,21 @@ fn get_config(state: tauri::State<Mutex<Config>>) -> Config {
 }
 
 #[tauri::command]
-fn save_config(state: tauri::State<Mutex<Config>>, mut config: Config) {
+fn save_config(app: AppHandle, mut config: Config) {
+    let state = app.state::<Mutex<Config>>();
     let mut cfg = state.lock().unwrap();
+    config.device_id.clone_from(&cfg.device_id);
+    let site_changed = config.url.trim_end_matches('/') != cfg.url.trim_end_matches('/');
+    if site_changed {
+        clear_device_session(&mut config);
+        *app.state::<Mutex<Option<String>>>().lock().unwrap() = None;
+        suspend_audio_for_access(&app);
+    } else {
+        config.token.clone_from(&cfg.token);
+        config.scope.clone_from(&cfg.scope);
+        config.logged_user.clone_from(&cfg.logged_user);
+        config.metadata_on = cfg.metadata_on;
+    }
     config.metadata_source.clone_from(&cfg.metadata_source);
     config.obs_port = cfg.obs_port;
     config.obs_tiktok_output.clone_from(&cfg.obs_tiktok_output);
@@ -893,7 +1003,8 @@ fn ensure_preview(
     app: AppHandle, gain1_db: f32, gain2_db: f32,
     route1: u8, route2: u8, monitor_db: f32,
 ) -> Result<bool, String> {
-    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+    let configs = app.state::<Mutex<Config>>();
+    let cfg = configs.lock().unwrap();
     if cfg.token.is_empty() || cfg.scope != "broadcast" { return Ok(false); }
     let state = app.state::<Mutex<Option<RunningMix>>>();
     let mut slot = state.lock().unwrap();
@@ -907,22 +1018,28 @@ fn ensure_preview(
     Ok(ready)
 }
 
-#[tauri::command(async)]
-fn start_broadcast(app: AppHandle) -> Result<(), String> {
-    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+#[tauri::command]
+async fn start_broadcast(app: AppHandle) -> Result<(), String> {
+    let configs = app.state::<Mutex<Config>>();
+    let cfg = configs.lock().unwrap().clone();
     if cfg.token.is_empty() || cfg.logged_user.is_empty() { return Err("Login dulu untuk memulai sesi".into()); }
     if cfg.scope != "broadcast" { return Err("Akun tidak memiliki akses siaran".into()); }
     let mix_state = app.state::<Mutex<Option<RunningMix>>>();
     if mix_state.lock().unwrap().as_ref().map(|rm| rm.session_active()).unwrap_or(false) { return Err("Sesi sudah berjalan".into()); }
-    let source = fetch_broadcast_config(&cfg)?;
+    let source = fetch_broadcast_config(&cfg).await?;
     let ffmpeg = bundled_ffmpeg(&app)?;
     let recording_dir = app.path().audio_dir().map_err(|e| e.to_string())?.join("8EH");
+    let current = configs.lock().unwrap();
+    if current.token != cfg.token || current.url != cfg.url || current.scope != "broadcast" {
+        return Err("Akses siaran berubah. Periksa status login.".into());
+    }
     let mut slot = mix_state.lock().unwrap();
     if !prepare_audio_engine(&mut slot, &cfg, (1.0, 1.0, 1.0), (1, 1))? { return Err("Input 1 belum dipilih".into()); }
     let rm = slot.as_mut().ok_or("Pratinjau audio belum tersedia")?;
     rm.start_session(&cfg, &ffmpeg, &source, &recording_dir)?;
     let stream_error = rm.stream_error.clone();
     drop(slot);
+    drop(current);
     let ui_state = app.state::<Mutex<BroadcastUi>>();
     let mut ui = ui_state.lock().unwrap();
     ui.push_log(if cfg.record_enabled { "Sesi dimulai: merekam dan menghubungkan Icecast".into() }
@@ -933,12 +1050,17 @@ fn start_broadcast(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command(async)]
-fn retry_broadcast(app: AppHandle) -> Result<(), String> {
-    let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
+#[tauri::command]
+async fn retry_broadcast(app: AppHandle) -> Result<(), String> {
+    let configs = app.state::<Mutex<Config>>();
+    let cfg = configs.lock().unwrap().clone();
     if cfg.scope != "broadcast" || cfg.token.is_empty() { return Err("Login siaran diperlukan".into()); }
-    let source = fetch_broadcast_config(&cfg)?;
+    let source = fetch_broadcast_config(&cfg).await?;
     let ffmpeg = bundled_ffmpeg(&app)?;
+    let current = configs.lock().unwrap();
+    if current.token != cfg.token || current.url != cfg.url || current.scope != "broadcast" {
+        return Err("Akses siaran berubah. Periksa status login.".into());
+    }
     let state = app.state::<Mutex<Option<RunningMix>>>();
     let mut slot = state.lock().unwrap();
     let rm = slot.as_mut().ok_or("Belum ada sesi siaran")?;
@@ -1117,6 +1239,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(Mutex::new(load_config_file()))
+        .manage(Mutex::new(SessionChecks::default()))
         .manage(Mutex::new(MetadataMode::default()))
         .manage(Mutex::new(MetadataStatus::default()))
         .manage(Mutex::<Option<String>>::new(None))
@@ -1169,13 +1292,17 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(250));
                 }
             });
+            let session_app = app.handle().clone();
+            std::thread::spawn(move || loop {
+                check_device_session(&session_app, false);
+                std::thread::sleep(Duration::from_secs(1));
+            });
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(10))
                     .build()
                     .expect("reqwest client");
-                let mut sync_tick = 0u32;
                 let mut engine = EngineState::default();
                 let mut target = (String::new(), String::new(), false);
                 loop {
@@ -1189,53 +1316,6 @@ fn main() {
                     engine.apply_mode(&requested);
                     engine_step(&mut engine, &cfg, &client);
                     *app_handle.state::<Mutex<MetadataStatus>>().lock().unwrap() = (&engine).into();
-                    // tiap 30s: sinkron status device dari server —
-                    // TERMASUK token (bisa berotasi kalau device di-approve ulang
-                    // dari akun lain), metadataEnabled, dan revoked.
-                    sync_tick = sync_tick.wrapping_add(1);
-                    if !cfg.url.is_empty() && !cfg.device_id.is_empty() && !cfg.token.is_empty() && sync_tick % 30 == 0 {
-                        let url = format!(
-                            "{}/api/studio/link-status?dev={}",
-                            cfg.url.trim_end_matches('/'),
-                            cfg.device_id
-                        );
-                        if let Ok(resp) = client.get(&url).send() {
-                            if let Ok(v) = resp.json::<serde_json::Value>() {
-                                let mut c = cfg_state.lock().unwrap();
-                                // Abaikan respons lama bila pengguna logout atau mulai login baru.
-                                if c.token == cfg.token && c.url == cfg.url {
-                                if v["status"] == "approved" {
-                                    // token bisa ter-rotasi oleh re-approval — selalu segarkan
-                                    if let Some(t) = v["token"].as_str() {
-                                        if !t.is_empty() {
-                                            c.token = t.to_string();
-                                        }
-                                    }
-                                    c.metadata_on =
-                                        v["metadataEnabled"].as_bool().unwrap_or(true);
-                                    if let Some(s) = v["scope"].as_str() {
-                                        c.scope = s.to_string();
-                                    }
-                                    if let Some(n) = v["user"]["name"].as_str() {
-                                        if !n.is_empty() && c.logged_user.is_empty() {
-                                            c.logged_user = n.to_string();
-                                        }
-                                    }
-                                } else if v["status"] == "revoked" {
-                                    c.token.clear();
-                                    c.scope.clear();
-                                    c.logged_user.clear();
-                                }
-                                let may_broadcast = !c.token.is_empty() && c.scope == "broadcast";
-                                persist_config(&c);
-                                drop(c);
-                                if !may_broadcast {
-                                    suspend_audio_for_access(&app_handle);
-                                }
-                                }
-                            }
-                        }
-                    }
                     std::thread::sleep(Duration::from_secs(1));
                 }
             });

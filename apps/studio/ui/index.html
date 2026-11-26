@@ -407,6 +407,7 @@
         $("onair").classList.toggle("primary", !s.running);
         const cfg = await invoke("get_config");
         const logged = !!(cfg.token && cfg.logged_user);
+        if (!s.running && !cfg.token && !linkPolling) $("login-gate").hidden = false;
         const videoAllowed = logged && cfg.scope === "broadcast";
         if (!videoAllowed && !$("page-video").hidden) showPage("siaran");
         $("tab-video").hidden = !videoAllowed;
@@ -561,8 +562,8 @@
       if (linkPolling) { clearInterval(linkPolling); linkPolling = null; }
     };
 
-    async function refreshLoginState() {
-      const c = await invoke("get_config");
+    async function refreshLoginState(c = null) {
+      c ??= await invoke("get_config");
       const logged = !!(c.token && c.logged_user);
       $("s-user").textContent = logged ? c.logged_user : "Belum login";
       $("s-scope").textContent = logged
@@ -592,25 +593,39 @@
     };
     $("gate-local").onclick = () => { $("gate-url").value = "http://localhost:3000"; $("gate-url").focus(); };
     $("gate-login").onclick = () => { $("url").value = $("gate-url").value.trim(); $("login").click(); };
-    async function checkLogin() {
-      try {
-        const state = await invoke("validate_login");
-        const session = await invoke("get_broadcast_status");
-        $("login-gate").hidden = state.status === "approved" || session.running;
-        $("gate-message").textContent = state.status === "approved" ? "Akses valid." : "Belum login. Buka browser untuk menautkan perangkat.";
-        await refreshLoginState();
-        if (state.status === "approved" && state.scope === "broadcast") await ensurePreview().catch((e) => feedback("preview-feedback", "Pratinjau audio: " + e, "err"));
-      } catch (e) {
-        const session = await invoke("get_broadcast_status").catch(() => ({ running: false }));
-        $("login-gate").hidden = session.running;
-        $("gate-message").textContent = "Tidak dapat memeriksa akses situs. Periksa koneksi, lalu coba lagi. " + e;
+    function showSessionCheckError(error) {
+      const message = "Tidak dapat memeriksa akses situs. Periksa koneksi, lalu coba lagi. " + error;
+      $("gate-message").textContent = message;
+      $("login-hint").textContent = message;
+    }
+    async function showDeviceSession(state) {
+      const session = await invoke("get_broadcast_status");
+      const c = await invoke("get_config");
+      if (linkPolling) return;
+      if (state.status === "error") {
+        showSessionCheckError(state.message);
+        return;
+      }
+      const approved = state.status === "approved";
+      if (approved !== !!c.token) return;
+      $("login-gate").hidden = approved || session.running;
+      const message = approved ? "Akses perangkat valid."
+        : state.status === "revoked" ? "Akses perangkat sudah tidak berlaku. Masuk kembali dengan Google."
+        : "Belum login. Buka browser untuk menautkan perangkat.";
+      $("gate-message").textContent = message;
+      $("login-hint").textContent = message;
+      await refreshLoginState(c);
+      if (approved && c.scope === "broadcast" && !session.preview_active) {
+        await ensurePreview().catch((e) => feedback("preview-feedback", "Pratinjau audio: " + e, "err"));
       }
     }
+    const checkLogin = () => invoke("validate_login").catch(showSessionCheckError);
     $("gate-retry").onclick = async () => {
       try {
         const requested = new URL($("gate-url").value.trim());
         if (!["http:", "https:"].includes(requested.protocol)) throw new Error("Alamat situs harus HTTP atau HTTPS.");
         const c = await invoke("get_config");
+        if (c.url.replace(/\/+$/, "") !== requested.origin) stopLinkPolling();
         c.url = requested.origin;
         await invoke("save_config", { config: c });
         $("url").value = c.url;
@@ -746,12 +761,15 @@
         const c = await invoke("get_config");
         const requested = new URL($("url").value.trim());
         if (!["http:", "https:"].includes(requested.protocol)) throw new Error("Alamat situs harus HTTP atau HTTPS.");
+        const siteChanged = c.url.replace(/\/+$/, "") !== requested.origin;
+        if (siteChanged) stopLinkPolling();
         c.url = requested.origin;
         await invoke("save_config", { config: c });
         $("url").value = c.url;
         $("gate-url").value = c.url;
         $("gate-advanced").open = c.url !== "https://www.8ehradioitb.com";
         feedback("settings-feedback", "Alamat situs tersimpan.", "ok");
+        if (siteChanged) await checkLogin();
         pollBroadcast();
       } catch (e) {
         const invalidUrl = e instanceof TypeError || String(e).includes("Alamat situs harus HTTP atau HTTPS");
@@ -765,8 +783,10 @@
     loadDevices().catch((e) => feedback("device-feedback", "Gagal memuat perangkat: " + e, "err"));
     loadSettings().catch((e) => feedback("settings-feedback", "Gagal memuat pengaturan: " + e, "err"));
     loadMetadataSources();
-    checkLogin();
     const appWindow = window.__TAURI__.window.getCurrentWindow();
+    appWindow.listen("device-session-checked", ({ payload }) => {
+      showDeviceSession(payload).catch(showSessionCheckError);
+    }).then(checkLogin).catch(showSessionCheckError);
     appWindow.listen("session-close-requested", async () => {
       if (!confirm("Sesi masih berjalan. Akhiri dan simpan rekaman sebelum menutup Studio?")) return;
       try {
@@ -776,7 +796,6 @@
     });
     setInterval(pollBroadcast, 500);
     setInterval(pollMetadata, 2000);
-    setInterval(checkLogin, 30000);
     pollBroadcast();
     pollMetadata();
   </script>
