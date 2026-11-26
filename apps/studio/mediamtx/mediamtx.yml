@@ -1,0 +1,40 @@
+authMethod: internal
+authInternalUsers:
+  - user: studio
+    # Compose replaces this with the deployment password.
+    pass: "sha256:lKet8ph+d15+DIvd4cdfDF1G9zCAVE6UTt2YCT1qLfU="
+    ips: []
+    permissions:
+      - action: publish
+        path: studio
+  - user: any
+    ips: []
+    permissions:
+      - action: read
+        path: studio
+
+api: false
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+webrtc: false
+srt: false
+moq: false
+
+rtmp: true
+rtmpEncryption: strict
+rtmpsAddress: :1936
+rtmpServerKey: /tls/privkey.pem
+rtmpServerCert: /tls/fullchain.pem
+
+hls: true
+hlsAddress: :8888
+hlsAlwaysRemux: true
+hlsVariant: fmp4
+hlsAllowOrigins: []
+
+paths:
+  studio:
+    source: publisher
+    overridePublisher: false

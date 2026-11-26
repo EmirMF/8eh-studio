@@ -17,4 +17,6 @@ function read(name) {
     return result;
   } catch (_) { return null; }
 }
-JSON.stringify(read("Spotify") || read("Music"));
+function run(args) {
+  return JSON.stringify(read(args[0]));
+}

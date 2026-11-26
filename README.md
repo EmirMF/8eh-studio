@@ -2,6 +2,8 @@
 
 Aplikasi desktop Windows untuk siaran Icecast, monitoring audio, rekaman MP3 opsional, dan metadata 8EH Radio ITB.
 
+Panduan [video OBS dan MediaMTX](apps/studio/mediamtx/README.md) mencakup dua output OBS, player website, dan setup staging.
+
 ## Build
 
 1. Clone repo dengan Git LFS tersedia, lalu jalankan `git lfs pull` agar `apps/studio/src-tauri/binaries/ffmpeg.exe` terunduh lengkap.

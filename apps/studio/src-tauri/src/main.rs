@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mixer;
+mod obs;
 #[cfg(windows)]
 #[path = "loopback.rs"]
 mod loopback;
@@ -8,7 +9,7 @@ mod loopback;
 #[path = "loopback_macos.rs"]
 mod loopback;
 
-use mixer::RunningMix;
+use mixer::{IcecastStatus, RunningMix};
 use serde::{Deserialize, Serialize};
 use base64::Engine as _;
 use std::hash::{Hash, Hasher};
@@ -38,6 +39,10 @@ struct Config {
     logged_user: String,
     scope: String,       // "broadcast" | "metadata" | "" (belum login)
     metadata_on: bool,  // bisa dimatikan dari dashboard (sinkron tiap heartbeat)
+    metadata_source: String,
+    obs_port: Option<u16>,
+    obs_tiktok_output: Option<String>,
+    obs_vertical_canvas: Option<String>,
     // broadcaster — input
     device: String,         // input 1 (utama)
     device2: Option<String>, // input 2 (opsional)
@@ -56,6 +61,10 @@ impl Default for Config {
             logged_user: String::new(),
             scope: String::new(),
             metadata_on: true,
+            metadata_source: "spotify".into(),
+            obs_port: None,
+            obs_tiktok_output: None,
+            obs_vertical_canvas: None,
             device: String::new(),
             device2: None,
             record_enabled: true,
@@ -139,6 +148,7 @@ fn persist_config(cfg: &Config) {
 #[derive(Default)]
 struct EngineState {
     mode: Mode,
+    auto_source: String,
     program_title: String,
     last_sent_key: String,
     candidate_key: String,
@@ -160,9 +170,29 @@ enum Mode {
     #[default]
     Auto,
     Program,
+    Fallback,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Clone)]
+struct MetadataMode {
+    mode: Mode,
+    program_title: String,
+}
+
+impl EngineState {
+    fn apply_mode(&mut self, request: &MetadataMode) {
+        if self.mode == request.mode && self.program_title == request.program_title {
+            return;
+        }
+        self.mode = request.mode;
+        self.program_title.clone_from(&request.program_title);
+        self.last_sent_key.clear();
+        self.last_error.clear();
+        reset_candidate(self);
+    }
+}
+
+#[derive(Default, Clone, Serialize)]
 struct MetadataStatus {
     push_ok: bool,
     last_error: String,
@@ -170,6 +200,65 @@ struct MetadataStatus {
     last_title: String,
     last_artist: String,
     last_cover: String,
+    fallback_applied: bool,
+}
+
+impl From<&EngineState> for MetadataStatus {
+    fn from(state: &EngineState) -> Self {
+        Self {
+            push_ok: state.push_ok,
+            last_error: state.last_error.clone(),
+            mode: state.mode,
+            last_title: state.last_title.clone(),
+            last_artist: state.last_artist.clone(),
+            last_cover: state.last_cover.clone(),
+            fallback_applied: state.mode == Mode::Fallback && state.last_sent_key == "clear",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MetadataSource {
+    id: String,
+    label: String,
+}
+
+fn fallback_title(title: &str) -> bool {
+    title.trim().is_empty()
+        || title.split(|c: char| !c.is_alphanumeric()).any(|word| {
+            word.eq_ignore_ascii_case("jingle") || word.eq_ignore_ascii_case("bumper")
+        })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_default_to_spotify_desktop() {
+        let config: Config = serde_json::from_str(r#"{"record_enabled":false}"#).unwrap();
+        assert_eq!(config.metadata_source, "spotify");
+        assert!(!config.record_enabled);
+    }
+
+    #[test]
+    fn only_whole_jingle_and_bumper_words_trigger_fallback() {
+        for title in [" ", "JINGLE_01", "8EH - Bumper Pagi", "[BumPer]", "Radio/Jingle"] {
+            assert!(fallback_title(title), "{title}");
+        }
+        for title in ["Jingles", "Bumpercar", "A Regular Song"] {
+            assert!(!fallback_title(title), "{title}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spotify_lock_distinguishes_desktop_from_web() {
+        assert!(spotify_session("Spotify.exe"));
+        assert!(spotify_session("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"));
+        assert!(!spotify_session("Chrome.Spotify"));
+        assert!(!spotify_session("NotSpotify.exe"));
+    }
 }
 
 struct Playback {
@@ -224,64 +313,74 @@ fn read_artwork(props: &smtc::GlobalSystemMediaTransportControlsSessionMediaProp
 }
 
 #[cfg(windows)]
-fn read_playback() -> Option<Playback> {
-    let manager = smtc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .ok()?
-        .get()
-        .ok()?;
+fn windows_sessions() -> Option<Vec<(String, smtc::GlobalSystemMediaTransportControlsSession)>> {
+    let manager = smtc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?.get().ok()?;
     let sessions = manager.GetSessions().ok()?;
-    let count = sessions.Size().ok()?;
-    if count == 0 {
-        return None;
-    }
-    let mut chosen: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
-    let mut first_playing: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
-    let mut first_session: Option<smtc::GlobalSystemMediaTransportControlsSession> = None;
-    for i in 0..count {
-        let s = sessions.GetAt(i).ok()?;
-        if first_session.is_none() {
-            first_session = Some(s.clone());
+    Some((0..sessions.Size().ok()?).filter_map(|index| {
+        let session = sessions.GetAt(index).ok()?;
+        let id = session.SourceAppUserModelId().ok()?.to_string();
+        Some((id, session))
+    }).collect())
+}
+
+#[cfg(windows)]
+fn spotify_session(id: &str) -> bool {
+    id.eq_ignore_ascii_case("Spotify.exe")
+        || id.eq_ignore_ascii_case("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify")
+}
+
+#[tauri::command]
+fn list_metadata_sources() -> Vec<MetadataSource> {
+    let mut sources = vec![MetadataSource { id: "spotify".into(), label: "Spotify Desktop".into() }];
+    #[cfg(target_os = "macos")]
+    sources.push(MetadataSource { id: "music".into(), label: "Apple Music".into() });
+    #[cfg(windows)]
+    for (id, _) in windows_sessions().unwrap_or_default() {
+        let key = format!("windows:{}", id.to_lowercase());
+        if !id.is_empty() && !spotify_session(&id) && !sources.iter().any(|source| source.id == key) {
+            sources.push(MetadataSource { id: key, label: id });
         }
-        let is_playing = s.GetPlaybackInfo().ok().and_then(|info| info.PlaybackStatus().ok())
-            == Some(smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
-        if is_playing {
-            let src = s.SourceAppUserModelId().ok().map(|v| v.to_string()).unwrap_or_default();
-            if src.to_lowercase().contains("spotify") {
-                chosen = Some(s);
-                break;
-            }
-            if first_playing.is_none() {
-                first_playing = Some(s);
-            }
-        }
     }
-    let session = chosen.or(first_playing).or(first_session)?;
-    let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
-    let playing = match session.GetPlaybackInfo() {
-        Ok(info) => matches!(
-            info.PlaybackStatus(),
-            Ok(smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
-        ),
-        Err(_) => false,
+    sources
+}
+
+#[cfg(windows)]
+fn read_playback(source: &str) -> Option<Playback> {
+    let is_playing = |session: &smtc::GlobalSystemMediaTransportControlsSession| {
+        session.GetPlaybackInfo().ok().and_then(|info| info.PlaybackStatus().ok())
+            == Some(smtc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
     };
+    let (_, session) = windows_sessions()?.into_iter().find(|(id, session)| {
+        let matches = if source == "spotify" {
+            spotify_session(id)
+        } else {
+            source.strip_prefix("windows:").is_some_and(|selected| id.to_lowercase() == selected)
+        };
+        matches && is_playing(session)
+    })?;
+    let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
+    let playing = is_playing(&session);
+    let title = props.Title().ok()?.to_string();
+    let artwork = if playing && !fallback_title(&title) { read_artwork(&props) } else { None };
     Some(Playback {
-        title: props.Title().ok()?.to_string(),
+        title,
         artist: props.Artist().unwrap_or_default().to_string(),
         playing,
-        artwork: if playing { read_artwork(&props) } else { None },
+        artwork,
     })
 }
 
 #[cfg(target_os = "macos")]
-fn read_playback() -> Option<Playback> {
+fn read_playback(source: &str) -> Option<Playback> {
     #[derive(Deserialize)]
     struct MacTrack { title: String, artist: String, playing: bool, artwork_url: Option<String> }
+    let app = match source { "spotify" => "Spotify", "music" => "Music", _ => return None };
     let output = std::process::Command::new("/usr/bin/osascript")
-        .args(["-l", "JavaScript", "-e", include_str!("metadata_macos.js")])
+        .args(["-l", "JavaScript", "-e", include_str!("metadata_macos.js"), app])
         .output().ok()?;
     if !output.status.success() { return None; }
     let track: MacTrack = serde_json::from_slice(&output.stdout).ok()?;
-    let artwork = track.artwork_url.and_then(|url| {
+    let artwork = track.artwork_url.filter(|_| track.playing && !fallback_title(&track.title)).and_then(|url| {
         let response = reqwest::blocking::Client::builder().timeout(Duration::from_secs(2)).build().ok()?
             .get(url).send().ok()?;
         if !response.status().is_success() || response.content_length().unwrap_or(0) > MAX_ARTWORK_BYTES { return None; }
@@ -324,23 +423,9 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
         };
         return;
     }
-    let need_beat = state
-        .last_heartbeat
-        .map(|t| t.elapsed().unwrap_or(Duration::MAX) >= HEARTBEAT)
-        .unwrap_or(true);
-    if need_beat {
-        match send_post(client, cfg, serde_json::json!({ "mode": "heartbeat" })) {
-            Ok(_) => {
-                state.last_heartbeat = Some(SystemTime::now());
-                state.push_ok = true;
-                state.last_error.clear();
-            }
-            Err(e) => {
-                state.push_ok = false;
-                state.last_error = e;
-                return;
-            }
-        }
+    if state.mode == Mode::Fallback {
+        try_clear(state, cfg, client);
+        return;
     }
 
     if state.mode == Mode::Program {
@@ -349,6 +434,7 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
             match send_post(client, cfg, serde_json::json!({ "mode": "program", "title": state.program_title })) {
                 Ok(response) => {
                     state.last_sent_key = key;
+                    state.last_heartbeat = Some(SystemTime::now());
                     state.push_ok = true;
                     state.last_error.clear();
                     state.last_title = state.program_title.clone();
@@ -360,24 +446,31 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
                     state.last_error = e;
                 }
             }
+        } else {
+            refresh_metadata_lease(state, cfg, client);
         }
         return;
     }
 
-    let pb = match read_playback() {
-        Some(p) => p,
-        None => {
+    if state.auto_source != cfg.metadata_source {
+        if !state.auto_source.is_empty() {
+            reset_candidate(state);
             try_clear(state, cfg, client);
-            return;
+            if state.last_sent_key != "clear" {
+                return;
+            }
         }
-    };
-    if !pb.playing {
+        state.auto_source = cfg.metadata_source.clone();
+    }
+    let Some(pb) = read_playback(&cfg.metadata_source).filter(|p| p.playing && !fallback_title(&p.title)) else {
         try_clear(state, cfg, client);
         return;
-    }
+    };
 
-    let key = format!("{}|{}|{}", pb.title, pb.artist, pb.artwork.as_ref().map(|a| a.fingerprint).unwrap_or(0));
+    let key = format!("auto|{}|{}|{}", pb.title, pb.artist, pb.artwork.as_ref().map(|a| a.fingerprint).unwrap_or(0));
     if key == state.last_sent_key {
+        reset_candidate(state);
+        refresh_metadata_lease(state, cfg, client);
         return;
     }
     if key != state.candidate_key {
@@ -411,6 +504,7 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
     ) {
         Ok(response) => {
             state.last_sent_key = state.candidate_key.clone();
+            state.last_heartbeat = Some(SystemTime::now());
             state.candidate_key.clear();
             state.candidate_artwork = None;
             state.push_ok = true;
@@ -426,17 +520,53 @@ fn engine_step(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking
     }
 }
 
+fn reset_candidate(state: &mut EngineState) {
+    state.candidate_key.clear();
+    state.candidate_seen = None;
+    state.candidate_artwork = None;
+}
+
+fn refresh_metadata_lease(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking::Client) {
+    if state.last_heartbeat.is_some_and(|time| time.elapsed().unwrap_or_default() < HEARTBEAT) {
+        return;
+    }
+    state.last_heartbeat = Some(SystemTime::now());
+    match send_post(client, cfg, serde_json::json!({ "mode": "heartbeat" })) {
+        Ok(response) if response["locked"] == true => {
+            state.last_sent_key.clear();
+            state.push_ok = false;
+            state.last_error = "Dashboard sedang mengontrol metadata".into();
+        }
+        Ok(_) => {
+            state.push_ok = true;
+            state.last_error.clear();
+        }
+        Err(error) => {
+            state.last_sent_key.clear();
+            state.push_ok = false;
+            state.last_error = error;
+        }
+    }
+}
+
 fn try_clear(state: &mut EngineState, cfg: &Config, client: &reqwest::blocking::Client) {
+    reset_candidate(state);
     if state.last_sent_key == "clear" {
         return;
     }
-    if send_post(client, cfg, serde_json::json!({ "mode": "clear" })).is_ok() {
-        state.last_sent_key = "clear".into();
-        state.push_ok = true;
-        state.last_error.clear();
-        state.last_title.clear();
-        state.last_artist.clear();
-        state.last_cover.clear();
+    match send_post(client, cfg, serde_json::json!({ "mode": "clear" })) {
+        Ok(response) => {
+            state.last_sent_key = "clear".into();
+            state.push_ok = true;
+            state.last_error.clear();
+            state.last_title = response["title"].as_str().unwrap_or_default().into();
+            state.last_artist = response["artist"].as_str().unwrap_or_default().into();
+            state.last_cover = response["coverImage"].as_str().unwrap_or_default().into();
+        }
+        Err(error) => {
+            state.push_ok = false;
+            state.last_error = error;
+        }
     }
 }
 
@@ -678,6 +808,8 @@ fn logout(app: AppHandle) {
     cfg.scope.clear();
     cfg.logged_user.clear();
     persist_config(&cfg);
+    drop(cfg);
+    obs::disconnect(&app);
     suspend_audio_for_access(&app);
 }
 
@@ -691,10 +823,28 @@ fn get_config(state: tauri::State<Mutex<Config>>) -> Config {
 }
 
 #[tauri::command]
-fn save_config(state: tauri::State<Mutex<Config>>, config: Config) {
+fn save_config(state: tauri::State<Mutex<Config>>, mut config: Config) {
     let mut cfg = state.lock().unwrap();
+    config.metadata_source.clone_from(&cfg.metadata_source);
+    config.obs_port = cfg.obs_port;
+    config.obs_tiktok_output.clone_from(&cfg.obs_tiktok_output);
+    config.obs_vertical_canvas.clone_from(&cfg.obs_vertical_canvas);
     *cfg = config;
     persist_config(&cfg);
+}
+
+#[tauri::command]
+fn set_metadata_source(state: tauri::State<Mutex<Config>>, source: String) -> Result<(), String> {
+    let supported = source == "spotify"
+        || (cfg!(target_os = "macos") && source == "music")
+        || (cfg!(windows) && source.strip_prefix("windows:").is_some_and(|id| !id.is_empty()));
+    if !supported {
+        return Err("Sumber Now Playing tidak didukung.".into());
+    }
+    let mut cfg = state.lock().unwrap();
+    cfg.metadata_source = source;
+    persist_config(&cfg);
+    Ok(())
 }
 
 #[tauri::command]
@@ -757,7 +907,7 @@ fn ensure_preview(
     Ok(ready)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_broadcast(app: AppHandle) -> Result<(), String> {
     let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
     if cfg.token.is_empty() || cfg.logged_user.is_empty() { return Err("Login dulu untuk memulai sesi".into()); }
@@ -771,19 +921,19 @@ fn start_broadcast(app: AppHandle) -> Result<(), String> {
     if !prepare_audio_engine(&mut slot, &cfg, (1.0, 1.0, 1.0), (1, 1))? { return Err("Input 1 belum dipilih".into()); }
     let rm = slot.as_mut().ok_or("Pratinjau audio belum tersedia")?;
     rm.start_session(&cfg, &ffmpeg, &source, &recording_dir)?;
-    let connected = rm.shared.stream_live.load(std::sync::atomic::Ordering::SeqCst);
+    let stream_error = rm.stream_error.clone();
     drop(slot);
     let ui_state = app.state::<Mutex<BroadcastUi>>();
     let mut ui = ui_state.lock().unwrap();
-    ui.push_log(if connected {
-        if cfg.record_enabled { "Sesi dimulai: merekam dan menghubungkan Icecast".into() }
-        else { "Sesi siaran dimulai tanpa rekaman".into() }
-    } else if cfg.record_enabled { "Rekaman dimulai; siaran belum terhubung. Gunakan Coba siaran lagi.".into() }
-    else { "Siaran belum terhubung. Gunakan Coba siaran lagi.".into() });
+    ui.push_log(if cfg.record_enabled { "Sesi dimulai: merekam dan menghubungkan Icecast".into() }
+        else { "Sesi siaran dimulai: menghubungkan Icecast".into() });
+    if let Some(error) = stream_error {
+        ui.push_log(error);
+    }
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn retry_broadcast(app: AppHandle) -> Result<(), String> {
     let cfg = app.state::<Mutex<Config>>().lock().unwrap().clone();
     if cfg.scope != "broadcast" || cfg.token.is_empty() { return Err("Login siaran diperlukan".into()); }
@@ -828,8 +978,10 @@ fn open_recording_folder(app: AppHandle) -> Result<(), String> {
 struct BroadcastStatus {
     running: bool,
     preview_active: bool,
-    stream_live: bool,
+    stream_status: IcecastStatus,
+    stream_error: Option<String>,
     record_live: bool,
+    record_overrun: bool,
     record_enabled: bool,
     secs: u64,
     meters_db: [f32; 4],
@@ -843,20 +995,23 @@ struct BroadcastStatus {
 fn get_broadcast_status(app: AppHandle) -> BroadcastStatus {
     let mut running = false;
     let mut preview_active = false;
-    let mut stream_live = false;
+    let mut stream_status = IcecastStatus::OffAir;
+    let mut stream_error = None;
     let mut record_live = false;
+    let mut record_overrun = false;
     let mut record_enabled = false;
     let mut secs = 0;
     let mut meters = [0f32; 4];
     let mut clipping = [false; 2];
     let mut monitor_error = None;
     if let Some(rm) = app.state::<Mutex<Option<RunningMix>>>().lock().unwrap().as_mut() {
-        rm.refresh_stream();
         rm.refresh_record();
         preview_active = true;
         running = rm.session_active();
-        stream_live = rm.shared.stream_live.load(std::sync::atomic::Ordering::SeqCst);
+        stream_status = rm.stream_status();
+        stream_error = rm.stream_error.clone();
         record_live = rm.shared.record_live.load(std::sync::atomic::Ordering::SeqCst);
+        record_overrun = rm.shared.record_overrun.load(std::sync::atomic::Ordering::SeqCst);
         record_enabled = rm.record_enabled;
         secs = rm.session_started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0);
         meters = *rm.shared.meters.lock().unwrap();
@@ -866,7 +1021,7 @@ fn get_broadcast_status(app: AppHandle) -> BroadcastStatus {
     let state = app.state::<Mutex<BroadcastUi>>();
     let ui = state.lock().unwrap();
     BroadcastStatus {
-        running, preview_active, stream_live, record_live, record_enabled, secs,
+        running, preview_active, stream_status, stream_error, record_live, record_overrun, record_enabled, secs,
         meters_db: meters.map(linear_to_db), clipping, monitor_error,
         log: ui.log.clone(),
         last_recording: ui.last_recording.clone(),
@@ -900,34 +1055,34 @@ fn set_mixer(
 // ============================================================
 
 #[tauri::command]
-fn set_mode(state: tauri::State<Mutex<EngineState>>, program: Option<String>) {
-    let mut st = state.lock().unwrap();
-    match program {
-        Some(title) if !title.trim().is_empty() => {
-            st.mode = Mode::Program;
-            st.program_title = title.trim().to_string();
-            st.last_sent_key.clear();
-        }
-        _ => {
-            st.mode = Mode::Auto;
-            st.program_title.clear();
-            st.last_sent_key.clear();
-            st.candidate_key.clear();
-        }
-    }
+fn set_mode(state: tauri::State<Mutex<MetadataMode>>, program: Option<String>) {
+    *state.lock().unwrap() = match program {
+        Some(title) if !title.trim().is_empty() => MetadataMode {
+            mode: Mode::Program,
+            program_title: title.trim().into(),
+        },
+        _ => MetadataMode::default(),
+    };
 }
 
 #[tauri::command]
-fn get_metadata_status(state: tauri::State<Mutex<EngineState>>) -> MetadataStatus {
-    let st = state.lock().unwrap();
-    MetadataStatus {
-        push_ok: st.push_ok,
-        last_error: st.last_error.clone(),
-        mode: st.mode,
-        last_title: st.last_title.clone(),
-        last_artist: st.last_artist.clone(),
-        last_cover: st.last_cover.clone(),
+fn show_broadcast_title(state: tauri::State<Mutex<MetadataMode>>) {
+    *state.lock().unwrap() = MetadataMode { mode: Mode::Fallback, program_title: String::new() };
+}
+
+#[tauri::command]
+fn get_metadata_status(
+    state: tauri::State<Mutex<MetadataStatus>>,
+    request: tauri::State<Mutex<MetadataMode>>,
+) -> MetadataStatus {
+    let mut status = state.lock().unwrap().clone();
+    let requested = request.lock().unwrap().mode;
+    if status.mode != requested {
+        status.mode = requested;
+        status.last_error.clear();
+        status.fallback_applied = false;
     }
+    status
 }
 
 // ============================================================
@@ -962,9 +1117,11 @@ fn main() {
 
     tauri::Builder::default()
         .manage(Mutex::new(load_config_file()))
-        .manage(Mutex::new(EngineState::default()))
+        .manage(Mutex::new(MetadataMode::default()))
+        .manage(Mutex::new(MetadataStatus::default()))
         .manage(Mutex::<Option<String>>::new(None))
         .manage(Mutex::new(BroadcastUi::default()))
+        .manage(Mutex::new(obs::Control::default()))
         .manage(Mutex::<Option<RunningMix>>::new(None))
         .invoke_handler(tauri::generate_handler![
             login_google,
@@ -983,7 +1140,16 @@ fn main() {
             get_broadcast_status,
             set_mixer,
             set_mode,
-            get_metadata_status
+            list_metadata_sources,
+            set_metadata_source,
+            show_broadcast_title,
+            get_metadata_status,
+            obs::obs_connect,
+            obs::obs_disconnect,
+            obs::obs_status,
+            obs::obs_save_tiktok,
+            obs::obs_set_stream,
+            obs::obs_set_scene
         ])
         .setup(|app| {
             #[cfg(windows)]
@@ -991,6 +1157,18 @@ fn main() {
                 let icon = tauri::image::Image::from_app_icon_resource(128)?;
                 window.set_icon(icon)?;
             }
+            let stream_app = app.handle().clone();
+            std::thread::spawn(move || {
+                loop {
+                    let state = stream_app.state::<Mutex<Option<RunningMix>>>();
+                    let mut mix = state.lock().unwrap();
+                    if let Some(error) = mix.as_mut().and_then(RunningMix::refresh_stream) {
+                        stream_app.state::<Mutex<BroadcastUi>>().lock().unwrap().push_log(error);
+                    }
+                    drop(mix);
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            });
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
@@ -998,14 +1176,19 @@ fn main() {
                     .build()
                     .expect("reqwest client");
                 let mut sync_tick = 0u32;
+                let mut engine = EngineState::default();
+                let mut target = (String::new(), String::new(), false);
                 loop {
                     let cfg_state = app_handle.state::<Mutex<Config>>();
                     let cfg = cfg_state.lock().unwrap().clone();
-                    if !cfg.url.is_empty() && !cfg.token.is_empty() {
-                        let engine_state = app_handle.state::<Mutex<EngineState>>();
-                        let mut st = engine_state.lock().unwrap();
-                        engine_step(&mut st, &cfg, &client);
+                    if target.0 != cfg.url || target.1 != cfg.token || target.2 != cfg.metadata_on {
+                        engine = EngineState::default();
+                        target = (cfg.url.clone(), cfg.token.clone(), cfg.metadata_on);
                     }
+                    let requested = app_handle.state::<Mutex<MetadataMode>>().lock().unwrap().clone();
+                    engine.apply_mode(&requested);
+                    engine_step(&mut engine, &cfg, &client);
+                    *app_handle.state::<Mutex<MetadataStatus>>().lock().unwrap() = (&engine).into();
                     // tiap 30s: sinkron status device dari server —
                     // TERMASUK token (bisa berotasi kalau device di-approve ulang
                     // dari akun lain), metadataEnabled, dan revoked.

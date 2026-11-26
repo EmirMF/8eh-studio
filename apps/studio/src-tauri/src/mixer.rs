@@ -13,12 +13,12 @@ use crate::{BroadcastConfig, Config};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream};
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -62,8 +62,8 @@ pub struct MixerShared {
     pub stop: AtomicBool,
     stream_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
     record_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
-    pub stream_live: Arc<AtomicBool>,
     pub record_live: Arc<AtomicBool>,
+    pub record_overrun: AtomicBool,
     pub monitor_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -80,8 +80,8 @@ impl MixerShared {
             stop: AtomicBool::new(false),
             stream_tx: Mutex::new(None),
             record_tx: Mutex::new(None),
-            stream_live: Arc::new(AtomicBool::new(false)),
             record_live: Arc::new(AtomicBool::new(false)),
+            record_overrun: AtomicBool::new(false),
             monitor_error: Arc::new(Mutex::new(None)),
         })
     }
@@ -344,6 +344,22 @@ impl Drop for StreamGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IcecastStatus {
+    OffAir,
+    Connecting,
+    OnAir,
+    Disconnected,
+}
+
+struct StreamAttempt {
+    child: Child,
+    started_at: Instant,
+    progress: Arc<Mutex<Option<Instant>>>,
+    writer_failed: Arc<AtomicBool>,
+}
+
 pub struct RunningMix {
     pub shared: Arc<MixerShared>,
     pub record_enabled: bool,
@@ -352,7 +368,8 @@ pub struct RunningMix {
     pub device2: Option<String>,
     pub monitor_device: String,
     record: Option<Child>,
-    stream: Option<Child>,
+    stream: Option<StreamAttempt>,
+    pub stream_error: Option<String>,
     record_writer: Option<std::thread::JoinHandle<()>>,
     mix_writer: Option<std::thread::JoinHandle<()>>,
     recording_temp: Option<std::path::PathBuf>,
@@ -370,11 +387,10 @@ impl RunningMix {
 
     pub fn disconnect_stream(&mut self) {
         *self.shared.stream_tx.lock().unwrap() = None;
-        if let Some(mut child) = self.stream.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut attempt) = self.stream.take() {
+            let _ = attempt.child.kill();
+            let _ = attempt.child.wait();
         }
-        self.shared.stream_live.store(false, Ordering::SeqCst);
     }
 
     pub fn refresh_record(&mut self) {
@@ -385,26 +401,53 @@ impl RunningMix {
         }
     }
 
-    pub fn refresh_stream(&mut self) {
-        if let Some(child) = self.stream.as_mut() {
-            let exited = child.try_wait().map(|s| s.is_some()).unwrap_or(true);
-            if exited || !self.shared.stream_live.load(Ordering::SeqCst) {
-                if !exited { let _ = child.kill(); let _ = child.wait(); }
-                self.shared.stream_live.store(false, Ordering::SeqCst);
-                *self.shared.stream_tx.lock().unwrap() = None;
-                self.stream = None;
+    pub fn stream_status(&self) -> IcecastStatus {
+        match &self.stream {
+            Some(attempt) if attempt.progress.lock().unwrap().is_some() => IcecastStatus::OnAir,
+            Some(_) => IcecastStatus::Connecting,
+            None if self.session_active() && self.stream_error.is_some() => IcecastStatus::Disconnected,
+            None => IcecastStatus::OffAir,
+        }
+    }
+
+    pub fn refresh_stream(&mut self) -> Option<String> {
+        let attempt = self.stream.as_mut()?;
+        let progress = *attempt.progress.lock().unwrap();
+        let exited = attempt.child.try_wait().map(|status| status.is_some()).unwrap_or(true);
+        let error = if exited || attempt.writer_failed.load(Ordering::SeqCst) {
+            if progress.is_some() { "Pengiriman audio Icecast berhenti." }
+            else { "Icecast gagal menerima siaran. Periksa koneksi dan konfigurasi server." }
+        } else if progress.is_some_and(|time| time.elapsed() >= Duration::from_secs(10)) {
+            "Pengiriman audio Icecast terhenti selama 10 detik."
+        } else if progress.is_none() && attempt.started_at.elapsed() >= Duration::from_secs(15) {
+            "Icecast belum menerima audio setelah 15 detik."
+        } else {
+            return None;
+        };
+        self.disconnect_stream();
+        self.stream_error = Some(error.into());
+        Some(error.into())
+    }
+
+    fn connect_stream(&mut self, ffmpeg_path: &std::path::Path, source: &BroadcastConfig) -> Result<(), String> {
+        match spawn_stream(ffmpeg_path, source) {
+            Ok((attempt, tx)) => {
+                *self.shared.stream_tx.lock().unwrap() = Some(tx);
+                self.stream = Some(attempt);
+                self.stream_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.stream_error = Some(error.clone());
+                Err(error)
             }
         }
     }
 
     pub fn retry_stream(&mut self, ffmpeg_path: &std::path::Path, source: &BroadcastConfig) -> Result<(), String> {
         if !self.session_active() { return Err("Belum ada sesi siaran".into()); }
-        self.refresh_stream();
-        if self.shared.stream_live.load(Ordering::SeqCst) { return Err("Siaran sudah terhubung".into()); }
-        let (child, tx) = spawn_stream(ffmpeg_path, source, self.shared.stream_live.clone())?;
-        *self.shared.stream_tx.lock().unwrap() = Some(tx);
-        self.stream = Some(child);
-        Ok(())
+        if self.stream.is_some() { return Err("Siaran sedang menghubungkan atau sudah terhubung".into()); }
+        self.connect_stream(ffmpeg_path, source)
     }
 }
 
@@ -413,6 +456,7 @@ impl RunningMix {
         if !self.session_active() { return Err("Belum ada sesi siaran".into()); }
         self.session_started_at = None;
         self.disconnect_stream();
+        self.stream_error = None;
         *self.shared.record_tx.lock().unwrap() = None;
         if let Some(writer) = self.record_writer.take() { let _ = writer.join(); }
         self.shared.record_live.store(false, Ordering::SeqCst);
@@ -456,24 +500,54 @@ fn pcm_command(ffmpeg_path: &std::path::Path, bitrate: u32) -> Command {
     command
 }
 
-fn spawn_stream(ffmpeg_path: &std::path::Path, source: &BroadcastConfig, live: Arc<AtomicBool>) -> Result<(Child, SyncSender<Vec<u8>>), String> {
+fn spawn_stream(ffmpeg_path: &std::path::Path, source: &BroadcastConfig) -> Result<(StreamAttempt, SyncSender<Vec<u8>>), String> {
     let mut url = reqwest::Url::parse(&format!("icecast://{}:{}/{}", source.host, source.port, source.mount.trim_start_matches('/')))
         .map_err(|_| "Alamat Icecast tidak valid".to_string())?;
     url.set_username(&source.username).map_err(|_| "Username Icecast tidak valid".to_string())?;
     url.set_password(Some(&source.password)).map_err(|_| "Password Icecast tidak valid".to_string())?;
     let mut command = pcm_command(ffmpeg_path, source.bitrate_kbps);
-    command.args(["-content_type", "audio/mpeg", url.as_str()]);
+    command.args(["-progress", "pipe:1", "-stats_period", "0.5", "-flush_packets", "1",
+        "-rw_timeout", "5000000", "-content_type", "audio/mpeg", url.as_str()]);
+    command.stdout(Stdio::piped());
     let mut child = command.spawn().map_err(|e| format!("FFmpeg siaran gagal dijalankan: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("Pipe FFmpeg siaran gagal")?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Pipe FFmpeg siaran gagal".into());
+    };
+    let started_at = Instant::now();
+    let progress = Arc::new(Mutex::new(None));
+    let writer_failed = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
-    live.store(true, Ordering::SeqCst);
+    let failed = writer_failed.clone();
     std::thread::spawn(move || {
         for bytes in rx {
-            if stdin.write_all(&bytes).is_err() { break; }
+            if stdin.write_all(&bytes).is_err() {
+                failed.store(true, Ordering::SeqCst);
+                break;
+            }
         }
-        live.store(false, Ordering::SeqCst);
     });
-    Ok((child, tx))
+    let latest = progress.clone();
+    std::thread::spawn(move || {
+        watch_stream_progress(BufReader::new(stdout), || {
+            *latest.lock().unwrap() = Some(Instant::now());
+        });
+    });
+    Ok((StreamAttempt { child, started_at, progress, writer_failed }, tx))
+}
+
+fn watch_stream_progress(reader: impl BufRead, mut advanced: impl FnMut()) {
+    let mut previous = 0;
+    let mut output_time = 0;
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(value) = line.strip_prefix("out_time_us=") {
+            output_time = value.parse::<i64>().unwrap_or_default();
+        } else if line == "progress=continue" && output_time > previous {
+            previous = output_time;
+            advanced();
+        }
+    }
 }
 
 pub fn start_preview(
@@ -531,7 +605,7 @@ pub fn start_preview(
     Ok(RunningMix {
         shared, record_enabled: false, session_started_at: None,
         device: cfg.device.clone(), device2: cfg.device2.clone(), monitor_device: cfg.monitor_device.clone(),
-        record: None, stream: None, record_writer: None, mix_writer: Some(mix_writer),
+        record: None, stream: None, stream_error: None, record_writer: None, mix_writer: Some(mix_writer),
         recording_temp: None, recording_final: None, guard, loopback,
     })
 }
@@ -545,6 +619,7 @@ impl RunningMix {
         recording_dir: &std::path::Path,
     ) -> Result<(), String> {
         if self.session_active() { return Err("Sesi sudah berjalan".into()); }
+        self.shared.record_overrun.store(false, Ordering::SeqCst);
         if cfg.record_enabled {
             std::fs::create_dir_all(recording_dir).map_err(|e| format!("Folder rekaman: {e}"))?;
             let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S_%3f");
@@ -569,13 +644,8 @@ impl RunningMix {
             *self.shared.record_tx.lock().unwrap() = Some(record_tx);
         }
         self.record_enabled = cfg.record_enabled;
-        let (stream, tx) = match spawn_stream(ffmpeg_path, source, self.shared.stream_live.clone()) {
-            Ok((stream, tx)) => (Some(stream), Some(tx)),
-            Err(_) => (None, None),
-        };
-        self.stream = stream;
-        *self.shared.stream_tx.lock().unwrap() = tx;
         self.session_started_at = Some(std::time::Instant::now());
+        let _ = self.connect_stream(ffmpeg_path, source);
         Ok(())
     }
 }
@@ -664,7 +734,7 @@ pub fn spawn_writer(shared: &Arc<MixerShared>) -> std::thread::JoinHandle<()> {
             if let Some(tx) = record {
                 match tx.try_send(buf.clone()) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => { shared.record_live.store(false, Ordering::SeqCst); }
+                    Err(TrySendError::Full(_)) => { shared.record_overrun.store(true, Ordering::SeqCst); }
                     Err(TrySendError::Disconnected(_)) => {
                         *shared.record_tx.lock().unwrap() = None;
                         shared.record_live.store(false, Ordering::SeqCst);
@@ -677,7 +747,6 @@ pub fn spawn_writer(shared: &Arc<MixerShared>) -> std::thread::JoinHandle<()> {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => {
                         *stream = None;
-                        shared.stream_live.store(false, Ordering::SeqCst);
                     }
                 }
             }
@@ -902,6 +971,18 @@ pub(crate) fn to_frames<I: Iterator<Item = f32>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icecast_only_counts_advancing_output_packets() {
+        let output = b"out_time_us=N/A\nprogress=continue\n\
+            out_time_us=500000\nprogress=continue\n\
+            out_time_us=500000\nprogress=continue\n\
+            out_time_us=600000\nprogress=continue\n\
+            out_time_us=700000\nprogress=end\n";
+        let mut updates = 0;
+        watch_stream_progress(&output[..], || updates += 1);
+        assert_eq!(updates, 2);
+    }
 
     fn crossings(samples: &[f32]) -> usize {
         samples.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count()

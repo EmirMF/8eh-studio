@@ -1,0 +1,13 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.4
+    restart: unless-stopped
+    environment:
+      MTX_AUTHINTERNALUSERS_0_PASS: "${VIDEO_PUBLISH_PASSWORD:?Set VIDEO_PUBLISH_PASSWORD}"
+      MTX_HLSALLOWORIGINS: "${VIDEO_WEB_ORIGINS:?Set VIDEO_WEB_ORIGINS}"
+    ports:
+      - "1936:1936/tcp"
+      - "127.0.0.1:8888:8888/tcp"
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - "${VIDEO_CERT_DIR:?Set VIDEO_CERT_DIR}:/tls:ro"
